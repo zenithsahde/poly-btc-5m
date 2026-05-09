@@ -1,0 +1,77 @@
+[package]
+name = "rust_engine"
+version = "0.4.5-5m"
+edition = "2021"
+authors = ["SJ Trading Engine"]
+description = "Binance WebSocket + Polymarket 5m 做市引擎（fork from market-maker@marker-fv）"
+
+[[bin]]
+name = "rust_engine"
+path = "src/main.rs"
+
+[dependencies]
+# 异步运行时 - tokio (full feature for work-stealing scheduler)
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket 客户端 - 基于 tokio，低延迟 TLS
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = { version = "0.24" }
+
+# TLS 支持
+native-tls = "0.2"
+
+# HTTP 客户端（REST API 下单）
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
+# 序列化 / 反序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# 配置文件管理（支持 toml + 环境变量 overlay）
+config = { version = "0.14", features = ["toml"] }
+
+# 结构化日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# 错误处理
+anyhow = "1"
+thiserror = "1"
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# futures-util (提供 SinkExt / StreamExt，tokio-tungstenite 依赖它但不 re-export)
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# 有序浮点（用于 BTreeMap 订单簿 key）
+ordered-float = "4"
+
+# 统计计算（P50/P99）
+hdrhistogram = "7"
+
+# 异步 channel
+tokio-stream = "0.1"
+
+# 环境变量
+dotenvy = "0.15"
+
+# TUI 面板
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Web3 / EIP-712 签名 (Alloy-rs)
+alloy-primitives = { version = "0.8", features = ["serde"] }
+alloy-sol-types = { version = "0.8" }
+alloy-signer = { version = "0.5" }
+alloy-signer-local = { version = "0.5" }
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1  # 开发模式适当优化，加快编译
