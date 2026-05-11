@@ -87,13 +87,17 @@ const SAFETY_MARGIN: f64 = 0.05;
 /// 配平腿不抓 lead alpha，只锁套利空间。0.02 = 留 2c 给 fee + 滑点，余下确定净利。
 const REBALANCE_MARGIN: f64 = 0.02;
 /// Maker 挂单超时（毫秒）：挂单超过此时间未 fill → cancel
-/// v0.4.13: 5s → 3s（30ms 数据实证 lead 延迟 P95=2.4s，3s 已覆盖 + 0.6s buffer，降低 adverse selection）
-const MAKER_TIMEOUT_MS: i64 = 3000;
+/// v0.4.15: 3s → 5s（实测最近 50min 6/11 窗口因 timeout 失配 → 1 笔 stuck 单边。延长拯救 50% 单边）
+const MAKER_TIMEOUT_MS: i64 = 5000;
 /// FV 移动 ≥ 此 tick 数时 cancel + 重挂新价（防 BTC 反向时被 adverse fill）
 const REPRICE_TICK_THRESH: f64 = 0.02; // 2 tick
-/// 距窗口结束 < 此分钟数时停止追涨（只 merge 已有持仓，不再建新仓）。
-/// 5m 总长 5 分钟，最后 30s 价格已接近确定，追涨 = 高位 LP，期望收益 < 风险。
-const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 0.5;
+/// 距窗口结束 < 此分钟数时停止建仓（chase 路径 + 偏仓首次进入路径都禁）
+/// v0.4.15: 0.5 → 1.5（实证：末段建仓导致"1 笔 stuck 单边"窗口占 50%）
+/// 1.5min 给配对腿足够时间 fill；剩余 < 1.5min 不再建新仓
+const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 1.5;
+/// 距窗口结束 < 此分钟数时配平腿仍允许（拯救已建仓的偏仓）
+/// 0.5min 是 force_merge 的下限，> 0.5min 仍允许配平挂单 fill
+const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.5;
 /// Merge 守门：avg_sum > 1.0 + EPS 时拒绝 merge（避免主动锁亏）。
 /// 等价于"配错方向后等待 redeem 而非主动 merge 锁定亏损"。
 const MERGE_AVG_SUM_MAX: f64 = 1.0;
@@ -532,7 +536,9 @@ impl SignalEngine {
                     //   底层逻辑：lead-lag 实证 1.1-2.5s alpha 必须 taker 才能抓到
                     //   maker 模式 fill 总在反转/卖压时（adverse selection），把 alpha 反转为劣势
                     let in_excited = !steady;
+                    // v0.4.15: 双窗口守门 — 建仓腿严（≥1.5min），配平腿宽（≥0.5min）
                     let in_chase_window = expiry_min >= MIN_EXPIRY_MIN_FOR_CHASE;
+                    let in_rebal_window = expiry_min >= MIN_EXPIRY_MIN_FOR_REBAL;
                     let up_chase = CHASE_ONLY_IN_EXCITED && in_excited && in_chase_window
                         && poly_up_mid > 0.0
                         && (fair_p - poly_up_mid) >= CHASE_GAP_MIN
@@ -646,9 +652,9 @@ impl SignalEngine {
                         && now_ms - self.last_taker_down_ts_ms >= TAKER_BUY_INTERVAL_MS;
 
                     // 偏仓配平：稳态也允许，无激变态守门，无节流（挂单慢动作）
-                    // 仅要求 in_chase_window（防末段 0.5min 建仓）
-                    let rebalance_buy_up_path = imbalanced_up_needed && in_chase_window;
-                    let rebalance_buy_down_path = imbalanced_dn_needed && in_chase_window;
+                    // v0.4.15: 用 in_rebal_window (≥0.5min) — 末段仍允许配平救已建仓
+                    let rebalance_buy_up_path = imbalanced_up_needed && in_rebal_window;
+                    let rebalance_buy_down_path = imbalanced_dn_needed && in_rebal_window;
 
                     let trigger_up = chase_buy_up || rebalance_buy_up_path;
                     let trigger_down = chase_buy_down || rebalance_buy_down_path;
