@@ -1,19 +1,23 @@
 // 初期开发阶段：让未使用字段/方法的 warning 不干扰 build 输出
 #![allow(dead_code, unused_variables)]
 
-/// main.rs - SJ Trading Engine 入口（TUI 版本）
+/// main.rs - SJ Trading Engine 入口
 ///
 /// 启动流程：
-/// 1. 加载配置 + 初始化日志（写入文件，不干扰 TUI）
-/// 2. 创建共享状态 Arc<RwLock<AppState>>
-/// 3. 启动 WS 客户端 task（自动重连）
-/// 4. 启动策略引擎 task（写入共享状态）
-/// 5. 主线程运行 TUI 渲染循环（每 50ms 刷新）
-/// 6. 按 'q' 或 Ctrl+C 优雅关闭
+/// 1. 解析 CLI（默认 `--tui`，可选 `--web`）
+/// 2. 加载配置 + 初始化日志
+/// 3. 创建共享状态 Arc<RwLock<AppState>>
+/// 4. 启动 WS 客户端 / 策略引擎 / 30ms 快照 tasks
+/// 5. 按模式分发：
+///    - `HEADLESS=1`：跳过 UI，仅采集
+///    - `--tui`（默认）：终端 TUI 50ms 刷新
+///    - `--web`：axum + SSE，浏览器面板
+/// 6. 'q' / Ctrl+C 优雅关闭
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -21,13 +25,16 @@ use crossterm::{
 };
 use ratatui::prelude::CrosstermBackend;
 
+mod cli;
 mod config;
 mod metrics;
 mod model;
 mod strategy;
 mod tui;
+mod web;
 mod ws;
 
+use cli::{Cli, Mode};
 use config::AppConfig;
 use strategy::signal::SignalEngine;
 use tui::app::AppState;
@@ -40,6 +47,9 @@ const TUI_REFRESH_MS: u64 = 50; // 20 FPS
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── 0. 解析 CLI ─────────────────────────────────────────────
+    let cli = Cli::parse();
+
     // ── 1. 加载配置 ────────────────────────────────────────────
     let _ = dotenvy::dotenv();
     let cfg = AppConfig::load()?;
@@ -184,7 +194,40 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── 7. 初始化 TUI 终端 ─────────────────────────────────────
+    // ── 8. 模式分发 ───────────────────────────────────────────
+    let result = match cli.mode() {
+        Mode::Tui => run_tui_mode(Arc::clone(&state)).await,
+        Mode::Web => {
+            eprintln!(
+                "🟢 Web 模式：访问 http://{}:{}/  （Ctrl+C 退出）",
+                cli.host, cli.port
+            );
+            tokio::select! {
+                r = web::serve(Arc::clone(&state), &cli.host, cli.port, &cli.web_dist) => r,
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("\n👋 收到 Ctrl+C，关闭中...");
+                    Ok(())
+                }
+            }
+        }
+    };
+
+    // ── 9. 清理任务 ───────────────────────────────────────────
+    ws_task.abort();
+    poly_task.abort();
+    strategy_task.abort();
+    snap30_task.abort();
+
+    if let Err(e) = result {
+        eprintln!("运行错误: {:?}", e);
+    }
+
+    println!("👋 SJ Trading Engine 已关闭");
+    Ok(())
+}
+
+/// TUI 模式：进入备用屏幕，运行 50ms 刷新循环，退出时清理终端。
+async fn run_tui_mode(state: Arc<RwLock<AppState>>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -192,24 +235,12 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.clear()?;
 
-    // ── 8. TUI 主循环 ──────────────────────────────────────────
-    let result = run_tui(&mut terminal, Arc::clone(&state)).await;
+    let result = run_tui(&mut terminal, state).await;
 
-    // ── 9. 清理终端，恢复正常模式 ─────────────────────────────
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
-    ws_task.abort();
-    poly_task.abort();
-    strategy_task.abort();
-
-    if let Err(e) = result {
-        eprintln!("TUI 错误: {:?}", e);
-    }
-
-    println!("👋 SJ Trading Engine 已关闭");
-    Ok(())
+    result
 }
 
 /// TUI 渲染主循环

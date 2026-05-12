@@ -1,0 +1,15 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+# 开发态：把 /api/* 反代到本机引擎（cargo run -p rust_engine -- --web --port 3000）
+proxy_backend = "http://127.0.0.1:3000/api/"
+proxy_rewrite = "/api/"
+
+[[hooks]]
+stage = "build"
+command = "echo"
+command_arguments = ["trunk build complete"]

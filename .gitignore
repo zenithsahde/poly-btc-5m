@@ -1,6 +1,7 @@
 # Build artifacts
 target/
 *.lock.bak
+web-ui/dist/
 
 # Trading data outputs (regenerated each run)
 trades/
