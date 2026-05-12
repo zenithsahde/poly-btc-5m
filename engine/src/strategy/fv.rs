@@ -69,19 +69,11 @@ impl FvEngine {
             0.0
         };
 
-        // 稳态时把可信 iv_raw 喂 EMA（5.0 上限防异常解爆掉）；激变态跳过
-        if inp.steady && iv_raw > 0.01 && iv_raw < 5.0 {
-            if self.sigma_ema <= 0.0 {
-                self.sigma_ema = iv_raw;
-            } else {
-                self.sigma_ema =
-                    SIGMA_EMA_ALPHA * iv_raw + (1.0 - SIGMA_EMA_ALPHA) * self.sigma_ema;
-            }
-        }
+        let sigma_ema_prev = self.sigma_ema;
 
-        let (sigma, sigma_used_default, sigma_source, new_sticky) = if self.sigma_ema > 0.01 {
-            let s = self.sigma_ema.clamp(inp.sigma_min, inp.sigma_max_poly);
-            (s, false, "Poly IV (EMA)", self.sigma_ema)
+        let (sigma, sigma_used_default, sigma_source, new_sticky) = if sigma_ema_prev > 0.01 {
+            let s = sigma_ema_prev.clamp(inp.sigma_min, inp.sigma_max_poly);
+            (s, false, "Poly IV (EMA)", sigma_ema_prev)
         } else if inp.steady && iv_raw > 0.01 {
             let s = iv_raw.clamp(inp.sigma_min, inp.sigma_max_poly);
             (s, false, "Poly IV (init)", iv_raw)
@@ -90,6 +82,16 @@ impl FvEngine {
         } else {
             (inp.default_sigma, true, "默认", inp.sticky_sigma)
         };
+
+        // 与 origin/main 对齐：当前 FV 使用上一帧 sigma_ema；随后才把本帧稳态 iv_raw 喂 EMA。
+        if inp.steady && iv_raw > 0.01 && iv_raw < 5.0 {
+            if self.sigma_ema <= 0.0 {
+                self.sigma_ema = iv_raw;
+            } else {
+                self.sigma_ema =
+                    SIGMA_EMA_ALPHA * iv_raw + (1.0 - SIGMA_EMA_ALPHA) * self.sigma_ema;
+            }
+        }
 
         let fair_up =
             bs_model::calculate_binary_call_price(inp.binance_mid, inp.strike, t_years, sigma);
