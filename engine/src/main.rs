@@ -200,6 +200,7 @@ async fn main() -> Result<()> {
         poly_task.abort();
         strategy_task.abort();
         snap30_task.abort();
+        flush_current_window_records(&state);
         eprintln!("👋 Headless 模式退出（CSV 已落盘）");
         return Ok(());
     }
@@ -227,6 +228,7 @@ async fn main() -> Result<()> {
     poly_task.abort();
     strategy_task.abort();
     snap30_task.abort();
+    flush_current_window_records(&state);
 
     if let Err(e) = result {
         eprintln!("运行错误: {:?}", e);
@@ -234,6 +236,25 @@ async fn main() -> Result<()> {
 
     println!("👋 SJ Trading Engine 已关闭");
     Ok(())
+}
+
+fn flush_current_window_records(state: &Arc<RwLock<AppState>>) {
+    let Ok(mut s) = state.write() else {
+        eprintln!("⚠️  退出时获取 AppState 写锁失败，无法保存当前窗口 CSV");
+        return;
+    };
+    let window_end_ts = s.poly_window_end_ts;
+    if window_end_ts == 0 {
+        eprintln!("⚠️  退出时尚无 Poly window_end_ts，跳过当前窗口 CSV 保存");
+        return;
+    }
+
+    if let Err(e) = s.save_trades_for_window_and_clear(window_end_ts) {
+        eprintln!("⚠️  退出时保存窗口 {} 成交记录失败: {:?}", window_end_ts, e);
+    }
+    if let Err(e) = s.save_orders_for_window_and_clear(window_end_ts) {
+        eprintln!("⚠️  退出时保存窗口 {} 订单记录失败: {:?}", window_end_ts, e);
+    }
 }
 
 /// TUI 模式：进入备用屏幕，运行 50ms 刷新循环，退出时清理终端。

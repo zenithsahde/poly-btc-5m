@@ -547,45 +547,43 @@ impl PositionLedger {
         let dir = Path::new("orders");
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("orders_{}.csv", window_end_ts));
-        if !self.order_history.is_empty() {
-            let mut f = std::fs::File::create(&path)?;
+        let mut f = std::fs::File::create(&path)?;
+        writeln!(
+            f,
+            "order_id,client_order_id,side,reason,target_price,worst_price,qty,filled_qty,vwap,fill_levels,status,reject_reason,placed_ts_ms,updated_ts_ms,placed_ts_iso,window_end_ts"
+        )?;
+        for o in &self.order_history {
+            let reject = o.reject_reason.clone().unwrap_or_default();
+            let vwap = o.vwap();
+            let placed_iso = chrono::Utc
+                .timestamp_millis_opt(o.placed_ts_ms)
+                .single()
+                .map(|t: chrono::DateTime<chrono::Utc>| {
+                    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                })
+                .unwrap_or_default();
             writeln!(
                 f,
-                "order_id,client_order_id,side,reason,target_price,worst_price,qty,filled_qty,vwap,fill_levels,status,reject_reason,placed_ts_ms,updated_ts_ms,placed_ts_iso,window_end_ts"
+                "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.6},{},{},{},{},{},{},{}",
+                o.order_id,
+                o.client_order_id,
+                side_label(o.side),
+                reason_label(o.reason),
+                o.target_price,
+                o.price,
+                o.qty,
+                o.filled_qty,
+                vwap,
+                o.fill_levels,
+                status_label(o.status),
+                reject,
+                o.placed_ts_ms,
+                o.updated_ts_ms,
+                placed_iso,
+                window_end_ts,
             )?;
-            for o in &self.order_history {
-                let reject = o.reject_reason.clone().unwrap_or_default();
-                let vwap = o.vwap();
-                let placed_iso = chrono::Utc
-                    .timestamp_millis_opt(o.placed_ts_ms)
-                    .single()
-                    .map(|t: chrono::DateTime<chrono::Utc>| {
-                        t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
-                    })
-                    .unwrap_or_default();
-                writeln!(
-                    f,
-                    "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.6},{},{},{},{},{},{},{}",
-                    o.order_id,
-                    o.client_order_id,
-                    side_label(o.side),
-                    reason_label(o.reason),
-                    o.target_price,
-                    o.price,
-                    o.qty,
-                    o.filled_qty,
-                    vwap,
-                    o.fill_levels,
-                    status_label(o.status),
-                    reject,
-                    o.placed_ts_ms,
-                    o.updated_ts_ms,
-                    placed_iso,
-                    window_end_ts,
-                )?;
-            }
-            f.flush()?;
         }
+        f.flush()?;
         self.order_history.clear();
         Self::prune_orders_dir_keep_latest(dir, 10)?;
         Ok(())
