@@ -5,6 +5,7 @@ web-ui/dist/
 
 # Trading data outputs (regenerated each run)
 trades/
+orders/
 fv_snapshots/
 excited_snapshots/
 snapshots_30ms/

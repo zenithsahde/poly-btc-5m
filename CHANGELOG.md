@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.4.6-5m] - 2026-05-12 (IOC 走簿 + order lifecycle 审计)
+
+### 重大架构变更
+
+**下单模拟从单档 taker 改为 Marketable IOC walk-the-book**：
+- 旧（v0.4.5）：信号触发后直接按 best_ask 记一笔 taker fill
+- 新（v0.4.6）：按 ask 簿逐档吃到 `worst_price`，剩余数量立即取消，不保留挂单
+
+### 底层逻辑
+
+IOC 的核心风控不再是"有没有成交"，而是"成交是否仍在 worst_price 内"：
+- chase 腿：`worst = target + CHASE_WORST_SLIPPAGE`
+- rebalance 腿：`worst = (1 - opp.avg) - REBAL_WORST_HEAD_ROOM`
+- 零成交归档为 `Cancelled + worst_breach`
+- 部分成交归档为 `Cancelled + ioc_remainder`
+- 完全成交归档为 `Filled`
+
+这让 dry-run 能看到"想下但没下成"的订单，而不只看到 trades.csv 里已经成交的部分。
+
+### 改动
+
+- 新增 `engine/src/execution/ioc.rs`
+  - `execute_ioc_buy()` 从低到高走 ask 簿
+  - 每档 fill 调用 `apply_fill()`，同时记录订单 VWAP 与吃簿档数
+- 新增 `engine/src/position.rs` 的 `ManagedOrder` 审计字段：
+  - `target_price`
+  - `filled_notional`
+  - `fill_levels`
+  - `vwap()`
+- `order_history` 增加 CSV 落盘：
+  - 路径：`orders/orders_{window_end_ts}.csv`
+  - 字段：`order_id,client_order_id,side,reason,target_price,worst_price,qty,filled_qty,vwap,fill_levels,status,reject_reason,placed_ts_ms,updated_ts_ms,placed_ts_iso,window_end_ts`
+  - 每次窗口切换后清空内存，只保留最新 10 个订单 CSV
+- 窗口切换顺序调整：
+  - `save_trades_for_window_and_clear`
+  - `settle_window_and_redeem`
+  - `reset_inventory_for_new_window`
+  - `save_orders_for_window_and_clear`
+  - 这样 reset 产生的 expired pending order 会归档到正确窗口
+- 新增 `scripts/window_report.py`
+  - 扫描 `trades/` + `orders/`
+  - 输出每窗口 trades/order 数、fill rate、worst_breach 率、partial 率、估算 PnL、残余单边、平均/最大吃簿档数
+  - 按 `chase` / `rebal` 分别统计成交率和 worst_breach 率
+  - 可选 `--csv` 导出累计报告
+
+### 可观测性提升
+
+现在 48h dry-run 后可以直接回答：
+- IOC 有多少被 `worst_breach` 拦下
+- 部分成交后取消的比例是多少
+- 单笔 IOC 平均吃几档、最多吃几档
+- chase 与 rebalance 各自成交率如何
+- 是否需要调松/收紧 `CHASE_WORST_SLIPPAGE` 或 `REBAL_WORST_HEAD_ROOM`
+
+### 使用
+
+```bash
+python3 scripts/window_report.py
+python3 scripts/window_report.py --csv /tmp/window_report.csv
+```
+
+### 验证
+
+- `cargo check` 通过
+- `cargo build --release` 通过
+- `python3 -m py_compile scripts/window_report.py` 通过
+- 使用 `/tmp` 样本 CSV 跑通 `scripts/window_report.py`
+
+---
+
 ## [0.4.5-5m] - 2026-05-08 (Taker-Only：抓 lead-lag alpha)
 
 ### 重大架构变更
