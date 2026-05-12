@@ -302,6 +302,11 @@ impl PolyWsClient {
             let binance_close = s.mid_price;
             s.settle_window_and_redeem(binance_close, now_ms);
             s.reset_inventory_for_new_window();
+            if old_window_ts != 0 {
+                if let Err(e) = s.save_orders_for_window_and_clear(old_window_ts) {
+                    tracing::warn!("保存窗口 {} 订单记录失败: {:?}", old_window_ts, e);
+                }
+            }
             s.poly_market_slug = new_market.slug.clone();
             s.poly_token_id = new_market.up_token_id.clone();
             s.poly_window_end_ts = new_market.window_end_ts;

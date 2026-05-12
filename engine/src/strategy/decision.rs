@@ -59,6 +59,7 @@ pub struct Thresholds {
 pub struct BuyIntent {
     pub side: ChaseSide,
     pub qty: f64,
+    pub target: f64,
     pub worst: f64,
     pub reason: PendingOrderReason,
     /// 当前决策帧的展示值（供 TUI 用），不影响执行
@@ -227,6 +228,7 @@ pub fn build_intents(
         intents.push(BuyIntent {
             side: ChaseSide::Up,
             qty: order_qty_up,
+            target: target_up,
             worst: worst_up,
             reason,
             rebalance_hint: None,
@@ -248,6 +250,7 @@ pub fn build_intents(
         intents.push(BuyIntent {
             side: ChaseSide::Down,
             qty: order_qty_down,
+            target: target_down,
             worst: worst_down,
             reason,
             rebalance_hint: None,

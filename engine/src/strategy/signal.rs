@@ -496,6 +496,7 @@ impl SignalEngine {
                         &mut *s,
                         intent.side,
                         intent.qty,
+                        intent.target,
                         intent.worst,
                         intent.reason,
                         now_ms,

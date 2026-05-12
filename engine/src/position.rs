@@ -9,11 +9,25 @@ pub enum PositionSide {
     Down,
 }
 
+fn side_label(side: PositionSide) -> &'static str {
+    match side {
+        PositionSide::Up => "UP",
+        PositionSide::Down => "DOWN",
+    }
+}
+
 /// 当前 pending 买单来源。区分追涨建仓和偏仓配平，便于后续独立统计与风控。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingOrderReason {
     Chase,
     Rebalance,
+}
+
+fn reason_label(reason: PendingOrderReason) -> &'static str {
+    match reason {
+        PendingOrderReason::Chase => "chase",
+        PendingOrderReason::Rebalance => "rebal",
+    }
 }
 
 /// 订单生命周期状态。实盘时仓位只应由真实 fill 回报推进。
@@ -52,6 +66,20 @@ impl OrderStatus {
     }
 }
 
+fn status_label(status: OrderStatus) -> &'static str {
+    match status {
+        OrderStatus::Created => "created",
+        OrderStatus::Submitted => "submitted",
+        OrderStatus::Accepted => "accepted",
+        OrderStatus::PartiallyFilled => "partial",
+        OrderStatus::Filled => "filled",
+        OrderStatus::CancelRequested => "cancel_requested",
+        OrderStatus::Cancelled => "cancelled",
+        OrderStatus::Rejected => "rejected",
+        OrderStatus::Expired => "expired",
+    }
+}
+
 /// 本地托管订单。当前 dry-run 只使用 Created/Filled/Expired；实盘接入后填充 order_hash 并按回报推进状态。
 #[derive(Clone, Debug)]
 pub struct ManagedOrder {
@@ -60,9 +88,16 @@ pub struct ManagedOrder {
     pub order_hash: Option<String>,
     pub side: PositionSide,
     pub buy_sell: bool,
+    /// 策略目标价（chase = FV - safety，rebal = 同侧 target），用于和 worst_price 对比评估滑点预算。
+    pub target_price: f64,
+    /// IOC 硬上限价（chase = target+slippage, rebal = (1-opp.avg)-headroom）。
     pub price: f64,
     pub qty: f64,
     pub filled_qty: f64,
+    /// fill 累计 notional = Σ(price_i × qty_i)，配合 filled_qty 算 VWAP
+    pub filled_notional: f64,
+    /// IOC 实际吃到的盘口档数；0 表示未成交，1 表示只吃 best ask。
+    pub fill_levels: u32,
     pub placed_ts_ms: i64,
     pub updated_ts_ms: i64,
     pub reason: PendingOrderReason,
@@ -79,19 +114,18 @@ impl ManagedOrder {
         placed_ts_ms: i64,
         reason: PendingOrderReason,
     ) -> Self {
-        let side_label = match side {
-            PositionSide::Up => "UP",
-            PositionSide::Down => "DOWN",
-        };
         Self {
             order_id,
-            client_order_id: format!("dry-{}-{}-{}", placed_ts_ms, side_label, order_id),
+            client_order_id: format!("dry-{}-{}-{}", placed_ts_ms, side_label(side), order_id),
             order_hash: None,
             side,
             buy_sell: true,
+            target_price: price,
             price,
             qty,
             filled_qty: 0.0,
+            filled_notional: 0.0,
+            fill_levels: 0,
             placed_ts_ms,
             updated_ts_ms: placed_ts_ms,
             reason,
@@ -137,6 +171,22 @@ impl ManagedOrder {
             OrderStatus::Filled
         };
         self.updated_ts_ms = ts_ms;
+    }
+
+    /// IOC walk-the-book 调用：记录某档 fill 的实际成交价，累计 notional 用于 VWAP
+    pub fn record_fill_at(&mut self, fill_qty: f64, fill_price: f64, ts_ms: i64) {
+        self.filled_notional += fill_qty * fill_price;
+        self.fill_levels = self.fill_levels.saturating_add(1);
+        self.record_fill(fill_qty, ts_ms);
+    }
+
+    /// VWAP；filled_qty=0 时返回 0
+    pub fn vwap(&self) -> f64 {
+        if self.filled_qty > 0.0 {
+            self.filled_notional / self.filled_qty
+        } else {
+            0.0
+        }
     }
 }
 
@@ -490,6 +540,57 @@ impl PositionLedger {
         Ok(())
     }
 
+    /// 将本窗口 order_history 全量落盘到 orders/orders_<window_end>.csv 并清空。
+    /// 每行 = 一笔 ManagedOrder 完整生命周期（含 worst_price / vwap / status / reject_reason），
+    /// 供 scripts/window_report.py 分析 IOC 质量：fill_rate / worst_breach 率 / partial 率。
+    pub fn save_orders_for_window_and_clear(&mut self, window_end_ts: i64) -> io::Result<()> {
+        let dir = Path::new("orders");
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("orders_{}.csv", window_end_ts));
+        if !self.order_history.is_empty() {
+            let mut f = std::fs::File::create(&path)?;
+            writeln!(
+                f,
+                "order_id,client_order_id,side,reason,target_price,worst_price,qty,filled_qty,vwap,fill_levels,status,reject_reason,placed_ts_ms,updated_ts_ms,placed_ts_iso,window_end_ts"
+            )?;
+            for o in &self.order_history {
+                let reject = o.reject_reason.clone().unwrap_or_default();
+                let vwap = o.vwap();
+                let placed_iso = chrono::Utc
+                    .timestamp_millis_opt(o.placed_ts_ms)
+                    .single()
+                    .map(|t: chrono::DateTime<chrono::Utc>| {
+                        t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                    })
+                    .unwrap_or_default();
+                writeln!(
+                    f,
+                    "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.6},{},{},{},{},{},{},{}",
+                    o.order_id,
+                    o.client_order_id,
+                    side_label(o.side),
+                    reason_label(o.reason),
+                    o.target_price,
+                    o.price,
+                    o.qty,
+                    o.filled_qty,
+                    vwap,
+                    o.fill_levels,
+                    status_label(o.status),
+                    reject,
+                    o.placed_ts_ms,
+                    o.updated_ts_ms,
+                    placed_iso,
+                    window_end_ts,
+                )?;
+            }
+            f.flush()?;
+        }
+        self.order_history.clear();
+        Self::prune_orders_dir_keep_latest(dir, 10)?;
+        Ok(())
+    }
+
     pub fn reset_for_new_window(&mut self) {
         self.position_up = Position::default();
         self.position_down = Position::default();
@@ -541,6 +642,37 @@ impl PositionLedger {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .and_then(|s| s.strip_prefix("trades_"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            ts_b.cmp(&ts_a)
+        });
+        for e in entries.into_iter().skip(keep) {
+            let _ = std::fs::remove_file(e.path());
+        }
+        Ok(())
+    }
+
+    fn prune_orders_dir_keep_latest(dir: &Path, keep: usize) -> io::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().map_or(false, |ext| ext == "csv")
+                    && e.file_name().to_string_lossy().starts_with("orders_")
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            let ts_a = a
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("orders_"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let ts_b = b
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("orders_"))
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
             ts_b.cmp(&ts_a)

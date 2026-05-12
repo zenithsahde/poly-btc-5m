@@ -391,6 +391,11 @@ impl AppState {
         self.ledger.save_trades_for_window_and_clear(window_end_ts)
     }
 
+    /// 市场切换时：将本窗口订单生命周期记录写入文件，再清空内存；只保留最新 10 份文件
+    pub fn save_orders_for_window_and_clear(&mut self, window_end_ts: i64) -> io::Result<()> {
+        self.ledger.save_orders_for_window_and_clear(window_end_ts)
+    }
+
     /// 市场切换后：清零本窗口仓位与挂单意图，新 5 分钟窗口从零库存开始
     /// v0.4.3-5m：所有 P&L 字段统一为跨窗口累积（fee / rebate / cash_* / merge_pnl 全保留）
     /// 仅清零物理上不能延续的字段（仓位/挂单/提示）—— 因为新窗口是新 token IDs，旧 qty 物理上失效

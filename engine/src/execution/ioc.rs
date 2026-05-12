@@ -23,6 +23,7 @@ pub fn execute_ioc_buy(
     s: &mut AppState,
     side: ChaseSide,
     want_qty: f64,
+    target_price: f64,
     worst_price: f64,
     reason: PendingOrderReason,
     ts_ms: i64,
@@ -48,6 +49,7 @@ pub fn execute_ioc_buy(
     let mut order: ManagedOrder =
         s.ledger
             .create_managed_buy_order(side, worst_price, want_qty, ts_ms, reason);
+    order.target_price = target_price;
 
     let mut remaining = want_qty;
     let mut fills: Vec<(f64, f64)> = Vec::new();
@@ -68,7 +70,7 @@ pub fn execute_ioc_buy(
 
     for (price, qty) in &fills {
         s.apply_fill(side, true, false, *price, *qty, ts_ms, ub, ua, db, da);
-        order.record_fill(*qty, ts_ms);
+        order.record_fill_at(*qty, *price, ts_ms);
     }
 
     let filled = order.filled_qty;
