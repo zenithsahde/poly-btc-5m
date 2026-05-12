@@ -189,7 +189,6 @@ impl SignalEngine {
                     // 更新消息速率
                     if let Ok(mut s) = self.state.write() {
                         s.total_msgs += 1;
-                        s.ws_connected = true;
                         s.update_rate();
                     }
                 }

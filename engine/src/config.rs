@@ -111,6 +111,14 @@ impl AppConfig {
     /// 构建 WebSocket 流地址
     /// 例：wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/btcusdt@depth@100ms
     pub fn build_ws_url(&self) -> String {
+        self.build_ws_url_for_endpoint(&self.exchange.ws_endpoint)
+    }
+
+    pub fn build_ws_url_alt(&self) -> String {
+        self.build_ws_url_for_endpoint(&self.exchange.ws_endpoint_alt)
+    }
+
+    fn build_ws_url_for_endpoint(&self, endpoint: &str) -> String {
         let symbol_lower = self.trading.symbol.to_lowercase();
         let streams: Vec<String> = self
             .trading
@@ -119,9 +127,6 @@ impl AppConfig {
             .map(|s| format!("{}@{}", symbol_lower, s))
             .collect();
         let stream_path = streams.join("/");
-        format!(
-            "{}/stream?streams={}",
-            self.exchange.ws_endpoint, stream_path
-        )
+        format!("{}/stream?streams={}", endpoint, stream_path)
     }
 }

@@ -74,8 +74,8 @@ impl BinanceWsClient {
 
     /// 启动客户端主循环（永久运行，自动重连）
     pub async fn run(self) -> Result<()> {
-        let ws_url = self.config.build_ws_url();
-        info!("🚀 WebSocket 目标连接: {}", ws_url);
+        let ws_urls = vec![self.config.build_ws_url(), self.config.build_ws_url_alt()];
+        info!("🚀 Binance WebSocket 目标连接: {:?}", ws_urls);
 
         let mut reconnect = ReconnectPolicy::new(
             self.config.websocket.reconnect_base_ms,
@@ -83,22 +83,24 @@ impl BinanceWsClient {
         );
 
         loop {
-            match self.connect_and_recv(&mut reconnect, &ws_url).await {
-                Ok(_) => {
-                    warn!("WebSocket 连接正常关闭，准备重连...");
+            for ws_url in &ws_urls {
+                match self.connect_and_recv(&mut reconnect, ws_url).await {
+                    Ok(_) => {
+                        warn!("Binance WebSocket 连接正常关闭，准备重连...");
+                    }
+                    Err(e) => {
+                        error!("Binance WebSocket 错误({}): {:?}", ws_url, e);
+                    }
                 }
-                Err(e) => {
-                    error!("WebSocket 错误: {:?}", e);
+                // 断线后必须显式回落 ws_connected，否则 UI/策略会继续以为还连着
+                if let Ok(mut s) = self.state.write() {
+                    s.ws_connected = false;
                 }
-            }
-            // 断线后必须显式回落 ws_connected，否则 UI/策略会继续以为还连着
-            if let Ok(mut s) = self.state.write() {
-                s.ws_connected = false;
             }
 
             let delay = reconnect.next_delay();
             warn!(
-                "第 {} 次重连，等待 {}ms...",
+                "Binance 第 {} 次重连，等待 {}ms...",
                 reconnect.attempt(),
                 delay.as_millis()
             );
@@ -108,7 +110,7 @@ impl BinanceWsClient {
 
     /// 单次连接 + 消息接收循环
     async fn connect_and_recv(&self, reconnect: &mut ReconnectPolicy, ws_url: &str) -> Result<()> {
-        info!("正在连接 Binance WebSocket...");
+        info!("正在连接 Binance WebSocket: {}", ws_url);
         let (ws_stream, response) = connect_async(ws_url).await.context("WebSocket 连接失败")?;
 
         info!("✅ WebSocket 已连接! HTTP Status: {}", response.status());
