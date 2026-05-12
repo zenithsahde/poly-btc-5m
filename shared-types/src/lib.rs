@@ -112,6 +112,16 @@ pub struct PositionView {
     pub rebalance_hint_down: Option<(f64, f64)>,
     pub maker_buy_intent_up: Option<(f64, f64, i64)>,
     pub maker_buy_intent_down: Option<(f64, f64, i64)>,
+    pub ioc_orders: usize,
+    pub ioc_fill_rate: f64,
+    pub ioc_worst_breach_rate: f64,
+    pub ioc_partial_rate: f64,
+    pub ioc_avg_fill_levels: f64,
+    pub ioc_max_fill_levels: u32,
+    pub ioc_chase_orders: usize,
+    pub ioc_chase_fill_rate: f64,
+    pub ioc_rebal_orders: usize,
+    pub ioc_rebal_fill_rate: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

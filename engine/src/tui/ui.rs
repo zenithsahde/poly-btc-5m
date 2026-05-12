@@ -27,8 +27,77 @@ use ratatui::{
 };
 use std::sync::RwLock;
 
-use crate::position::{ManagedOrder, PendingOrderReason};
+use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason};
 use crate::tui::app::{AppState, ChaseSide};
+
+#[derive(Default)]
+struct IocStats {
+    orders: usize,
+    filled_orders: usize,
+    worst_breach: usize,
+    partial: usize,
+    fill_levels_sum: u32,
+    fill_levels_max: u32,
+    chase_orders: usize,
+    chase_filled: usize,
+    rebal_orders: usize,
+    rebal_filled: usize,
+}
+
+impl IocStats {
+    fn from_orders(orders: &[ManagedOrder]) -> Self {
+        let mut stats = Self::default();
+        for order in orders {
+            stats.orders += 1;
+            let filled = order.filled_qty > 0.0;
+            if filled {
+                stats.filled_orders += 1;
+                stats.fill_levels_sum = stats.fill_levels_sum.saturating_add(order.fill_levels);
+                stats.fill_levels_max = stats.fill_levels_max.max(order.fill_levels);
+            }
+            if order.reject_reason.as_deref() == Some("worst_breach") {
+                stats.worst_breach += 1;
+            }
+            if order.reject_reason.as_deref() == Some("ioc_remainder")
+                || (filled && order.filled_qty < order.qty)
+                || order.status == OrderStatus::PartiallyFilled
+            {
+                stats.partial += 1;
+            }
+            match order.reason {
+                PendingOrderReason::Chase => {
+                    stats.chase_orders += 1;
+                    if filled {
+                        stats.chase_filled += 1;
+                    }
+                }
+                PendingOrderReason::Rebalance => {
+                    stats.rebal_orders += 1;
+                    if filled {
+                        stats.rebal_filled += 1;
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    fn pct(part: usize, total: usize) -> String {
+        if total == 0 {
+            "--".to_string()
+        } else {
+            format!("{:.0}%", part as f64 * 100.0 / total as f64)
+        }
+    }
+
+    fn avg_levels(&self) -> f64 {
+        if self.filled_orders == 0 {
+            0.0
+        } else {
+            self.fill_levels_sum as f64 / self.filled_orders as f64
+        }
+    }
+}
 
 fn pending_reason_label(reason: PendingOrderReason) -> &'static str {
     match reason {
@@ -447,10 +516,10 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // 挂单信息：用于在订单簿档位打标及底部汇总
+    // 订单意图信息：IOC 模式通常不保留挂单，仅用于兼容历史 pending 展示
     let up_buy = s.ledger.maker_buy_intent_up.as_ref();
     let down_buy = s.ledger.maker_buy_intent_down.as_ref();
-    // v0.4.0-5m：sell 全部废弃，挂单只剩 maker buy（卖侧用 merge 退出）
+    // v0.4.0-5m：sell 全部废弃，买侧由 IOC / 历史 pending 兼容字段展示
     let up_sell: Option<(f64, f64)> = None;
     let down_sell: Option<(f64, f64)> = None;
     fn near(a: f64, b: f64) -> bool {
@@ -634,7 +703,7 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     .column_spacing(1);
     frame.render_widget(table, inner_split[0]);
 
-    // 底部挂单汇总：方向、价格、数量
+    // 底部订单汇总：方向、价格、数量
     let up_buy_str = up_buy
         .map(format_pending_buy)
         .unwrap_or_else(|| "买—".to_string());
@@ -648,7 +717,7 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
         .map(|(p, q)| format!("卖@{:.2}×{:.2}", p, q))
         .unwrap_or_else(|| "卖—".to_string());
     let footer_text = Line::from(vec![
-        Span::styled(" 挂单 ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" 订单 ", Style::default().fg(Color::DarkGray)),
         Span::styled("Up ", Style::default().fg(Color::Green)),
         Span::raw(up_buy_str),
         Span::raw(" "),
@@ -877,6 +946,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
         Some(ChaseSide::Down) => "DOWN",
         None => "—",
     };
+    let ioc = IocStats::from_orders(&s.ledger.order_history);
 
     let text = Text::from(vec![
         Line::from(vec![
@@ -931,7 +1001,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                     Color::Yellow
                 }),
             ),
-            Span::raw("  挂单若成交="),
+            Span::raw("  IOC若成交="),
             Span::styled(
                 format!("{:.2}", s.projected_avg_sum_after_intents()),
                 Style::default().fg(if s.projected_avg_sum_after_intents() < 1.0 {
@@ -985,7 +1055,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                 format!("{:+.4}", s.inventory_value()),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw("  Taker费=-"),
+            Span::raw("  IOC/Taker费=-"),
             Span::styled(
                 format!("{:.4}", s.ledger.total_fee),
                 Style::default().fg(Color::Red),
@@ -1060,8 +1130,8 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                 })
                 .unwrap_or_else(|| "—".to_string());
             vec![
-                Span::raw("  挂单 "),
-                Span::styled("Maker买", Style::default().fg(Color::Cyan)),
+                Span::raw("  订单 "),
+                Span::styled("IOC买", Style::default().fg(Color::Cyan)),
                 Span::raw(": "),
                 Span::styled(up_str, Style::default().fg(Color::White)),
                 Span::raw("  "),
@@ -1086,6 +1156,71 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                 Span::styled(down_hint, Style::default().fg(Color::DarkGray)),
             ]
         }),
+        Line::from(vec![
+            Span::raw("  IOC "),
+            Span::styled(
+                format!("ord={} ", ioc.orders),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw("fill="),
+            Span::styled(
+                IocStats::pct(ioc.filled_orders, ioc.orders),
+                Style::default().fg(if ioc.orders == 0 || ioc.filled_orders > 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::raw("  worst="),
+            Span::styled(
+                IocStats::pct(ioc.worst_breach, ioc.orders),
+                Style::default().fg(if ioc.worst_breach == 0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
+            Span::raw("  partial="),
+            Span::styled(
+                IocStats::pct(ioc.partial, ioc.orders),
+                Style::default().fg(if ioc.partial == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            Span::raw("  档数="),
+            Span::styled(
+                if ioc.filled_orders == 0 {
+                    "--".to_string()
+                } else {
+                    format!("{:.1}/{}", ioc.avg_levels(), ioc.fill_levels_max)
+                },
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  IOC分类 "),
+            Span::styled(
+                format!(
+                    "chase {}/{}({})",
+                    ioc.chase_filled,
+                    ioc.chase_orders,
+                    IocStats::pct(ioc.chase_filled, ioc.chase_orders)
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "rebal {}/{}({})",
+                    ioc.rebal_filled,
+                    ioc.rebal_orders,
+                    IocStats::pct(ioc.rebal_filled, ioc.rebal_orders)
+                ),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
     ]);
 
     let para = Paragraph::new(text);

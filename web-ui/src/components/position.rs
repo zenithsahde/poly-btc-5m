@@ -31,6 +31,39 @@ pub fn PositionPanel() -> impl IntoView {
         else { "text-2xl font-semibold numeric text-zinc-200" }
     });
     let chase = Signal::derive(move || snapshot.with(|s| s.as_ref().and_then(|s| s.position.chase_side.clone()).unwrap_or_else(|| "—".into())));
+    let ioc_orders = Signal::derive(move || {
+        snapshot.with(|s| s.as_ref().map(|s| s.position.ioc_orders).unwrap_or(0)).to_string()
+    });
+    let ioc_fill = Signal::derive(move || {
+        pct(snapshot.with(|s| s.as_ref().map(|s| s.position.ioc_fill_rate).unwrap_or(0.0)))
+    });
+    let ioc_worst = Signal::derive(move || {
+        pct(snapshot.with(|s| s.as_ref().map(|s| s.position.ioc_worst_breach_rate).unwrap_or(0.0)))
+    });
+    let ioc_partial = Signal::derive(move || {
+        pct(snapshot.with(|s| s.as_ref().map(|s| s.position.ioc_partial_rate).unwrap_or(0.0)))
+    });
+    let ioc_levels = Signal::derive(move || snapshot.with(|s| {
+        s.as_ref()
+            .map(|s| {
+                if s.position.ioc_orders == 0 {
+                    "—".to_string()
+                } else {
+                    format!("{:.1}/{}", s.position.ioc_avg_fill_levels, s.position.ioc_max_fill_levels)
+                }
+            })
+            .unwrap_or_else(|| "—".to_string())
+    }));
+    let ioc_chase = Signal::derive(move || snapshot.with(|s| {
+        s.as_ref()
+            .map(|s| format!("{} {}", s.position.ioc_chase_orders, pct(s.position.ioc_chase_fill_rate)))
+            .unwrap_or_else(|| "0 —".to_string())
+    }));
+    let ioc_rebal = Signal::derive(move || snapshot.with(|s| {
+        s.as_ref()
+            .map(|s| format!("{} {}", s.position.ioc_rebal_orders, pct(s.position.ioc_rebal_fill_rate)))
+            .unwrap_or_else(|| "0 —".to_string())
+    }));
 
     view! {
         <div class="card">
@@ -54,11 +87,28 @@ pub fn PositionPanel() -> impl IntoView {
                 <Kv k="cash pnl" v=cash_pnl />
                 <Kv k="inventory" v=inv_val />
             </div>
+            <div class="mt-3 pt-3 border-t border-border space-y-1">
+                <Kv k="ioc orders" v=ioc_orders />
+                <Kv k="ioc fill" v=ioc_fill />
+                <Kv k="worst" v=ioc_worst />
+                <Kv k="partial" v=ioc_partial />
+                <Kv k="levels" v=ioc_levels />
+                <Kv k="chase" v=ioc_chase />
+                <Kv k="rebal" v=ioc_rebal />
+            </div>
             <div class="mt-3 pt-3 border-t border-border flex items-baseline justify-between">
                 <span class="text-xs text-zinc-400 uppercase tracking-wider">"net pnl"</span>
                 <span class={move || net_class.get()}>{move || net_text.get()}</span>
             </div>
         </div>
+    }
+}
+
+fn pct(value: f64) -> String {
+    if value <= 0.0 {
+        "—".to_string()
+    } else {
+        format!("{:.0}%", value * 100.0)
     }
 }
 

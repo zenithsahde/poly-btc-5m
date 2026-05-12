@@ -10,7 +10,7 @@ use shared_types::{
     OrderbookView, PolyBook, PolyView, PositionSide, PositionView, TradeRow,
 };
 
-use crate::position::ManagedOrder;
+use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason};
 use crate::tui::app::{AppState, BookLevel, ChaseSide};
 
 const POLY_BOOK_DEPTH: usize = 15;
@@ -88,6 +88,7 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
 
     let up_mid = s.poly_up_mid();
     let down_mid = s.poly_down_mid();
+    let ioc = ioc_stats(&s.ledger.order_history);
     let position = PositionView {
         up: PositionSide {
             qty: s.ledger.position_up.qty,
@@ -117,6 +118,20 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         rebalance_hint_down: s.ledger.rebalance_hint_down,
         maker_buy_intent_up: managed_order_tuple(s.ledger.maker_buy_intent_up.as_ref()),
         maker_buy_intent_down: managed_order_tuple(s.ledger.maker_buy_intent_down.as_ref()),
+        ioc_orders: ioc.orders,
+        ioc_fill_rate: rate(ioc.filled_orders, ioc.orders),
+        ioc_worst_breach_rate: rate(ioc.worst_breach, ioc.orders),
+        ioc_partial_rate: rate(ioc.partial, ioc.orders),
+        ioc_avg_fill_levels: if ioc.filled_orders == 0 {
+            0.0
+        } else {
+            ioc.fill_levels_sum as f64 / ioc.filled_orders as f64
+        },
+        ioc_max_fill_levels: ioc.fill_levels_max,
+        ioc_chase_orders: ioc.chase_orders,
+        ioc_chase_fill_rate: rate(ioc.chase_filled, ioc.chase_orders),
+        ioc_rebal_orders: ioc.rebal_orders,
+        ioc_rebal_fill_rate: rate(ioc.rebal_filled, ioc.rebal_orders),
     };
 
     let fair_value = FairValueView {
@@ -189,4 +204,63 @@ fn chase_side_str(s: ChaseSide) -> String {
 
 fn managed_order_tuple(order: Option<&ManagedOrder>) -> Option<(f64, f64, i64)> {
     order.map(|o| (o.price, o.remaining_qty(), o.placed_ts_ms))
+}
+
+#[derive(Default)]
+struct IocStats {
+    orders: usize,
+    filled_orders: usize,
+    worst_breach: usize,
+    partial: usize,
+    fill_levels_sum: u32,
+    fill_levels_max: u32,
+    chase_orders: usize,
+    chase_filled: usize,
+    rebal_orders: usize,
+    rebal_filled: usize,
+}
+
+fn ioc_stats(orders: &[ManagedOrder]) -> IocStats {
+    let mut stats = IocStats::default();
+    for order in orders {
+        stats.orders += 1;
+        let filled = order.filled_qty > 0.0;
+        if filled {
+            stats.filled_orders += 1;
+            stats.fill_levels_sum = stats.fill_levels_sum.saturating_add(order.fill_levels);
+            stats.fill_levels_max = stats.fill_levels_max.max(order.fill_levels);
+        }
+        if order.reject_reason.as_deref() == Some("worst_breach") {
+            stats.worst_breach += 1;
+        }
+        if order.reject_reason.as_deref() == Some("ioc_remainder")
+            || (filled && order.filled_qty < order.qty)
+            || order.status == OrderStatus::PartiallyFilled
+        {
+            stats.partial += 1;
+        }
+        match order.reason {
+            PendingOrderReason::Chase => {
+                stats.chase_orders += 1;
+                if filled {
+                    stats.chase_filled += 1;
+                }
+            }
+            PendingOrderReason::Rebalance => {
+                stats.rebal_orders += 1;
+                if filled {
+                    stats.rebal_filled += 1;
+                }
+            }
+        }
+    }
+    stats
+}
+
+fn rate(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64
+    }
 }
