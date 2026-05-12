@@ -27,7 +27,7 @@ use ratatui::{
 };
 use std::sync::RwLock;
 
-use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason};
+use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason, PositionSide, TradeRecord};
 use crate::tui::app::{AppState, ChaseSide};
 
 #[derive(Default)]
@@ -97,6 +97,103 @@ impl IocStats {
             self.fill_levels_sum as f64 / self.filled_orders as f64
         }
     }
+
+    fn last_order<'a>(&self, orders: &'a [ManagedOrder]) -> Option<&'a ManagedOrder> {
+        orders.iter().max_by_key(|o| o.updated_ts_ms)
+    }
+}
+
+fn ioc_order_summary(order: &ManagedOrder) -> String {
+    let side = match order.side {
+        PositionSide::Up => "UP",
+        PositionSide::Down => "DOWN",
+    };
+    let reason = pending_reason_label(order.reason);
+    let status =
+        if order.filled_qty <= 0.0 && order.reject_reason.as_deref() == Some("worst_breach") {
+            "拒单"
+        } else if order.reject_reason.as_deref() == Some("ioc_remainder") {
+            "部分"
+        } else if order.filled_qty > 0.0 {
+            "成交"
+        } else {
+            "取消"
+        };
+    if order.filled_qty > 0.0 {
+        format!(
+            "{} {}/{} {:.0}/{:.0}张 VWAP={:.2} 档={}",
+            side,
+            status,
+            reason,
+            order.filled_qty,
+            order.qty,
+            order.vwap(),
+            order.fill_levels
+        )
+    } else {
+        format!(
+            "{} {}/{} 0/{:.0}张 worst={:.2}",
+            side, status, reason, order.qty, order.price
+        )
+    }
+}
+
+#[derive(Default)]
+struct WindowFillStats {
+    fill_rows: usize,
+    up_qty: f64,
+    up_notional: f64,
+    down_qty: f64,
+    down_notional: f64,
+}
+
+impl WindowFillStats {
+    fn from_trades(trades: &[TradeRecord]) -> Self {
+        let mut stats = Self::default();
+        for trade in trades.iter().filter(|t| t.buy_sell) {
+            stats.fill_rows += 1;
+            let notional = trade.price * trade.qty;
+            match trade.side {
+                PositionSide::Up => {
+                    stats.up_qty += trade.qty;
+                    stats.up_notional += notional;
+                }
+                PositionSide::Down => {
+                    stats.down_qty += trade.qty;
+                    stats.down_notional += notional;
+                }
+            }
+        }
+        stats
+    }
+
+    fn up_vwap(&self) -> f64 {
+        if self.up_qty > 0.0 {
+            self.up_notional / self.up_qty
+        } else {
+            0.0
+        }
+    }
+
+    fn down_vwap(&self) -> f64 {
+        if self.down_qty > 0.0 {
+            self.down_notional / self.down_qty
+        } else {
+            0.0
+        }
+    }
+
+    fn total_notional(&self) -> f64 {
+        self.up_notional + self.down_notional
+    }
+}
+
+fn fill_side_summary(qty: f64, vwap: f64) -> String {
+    if qty > 0.0 {
+        format!("{:.0}@{:.2}", qty, vwap)
+    } else {
+        "0".to_string()
+    }
 }
 
 fn pending_reason_label(reason: PendingOrderReason) -> &'static str {
@@ -144,7 +241,7 @@ pub fn render(frame: &mut Frame, state: &RwLock<AppState>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Min(4),
+            Constraint::Min(10),
             Constraint::Length(8),
             Constraint::Min(14),
         ])
@@ -947,10 +1044,11 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
         None => "—",
     };
     let ioc = IocStats::from_orders(&s.ledger.order_history);
+    let fills = WindowFillStats::from_trades(&s.ledger.trades_current_window);
 
     let text = Text::from(vec![
         Line::from(vec![
-            Span::raw("  UP:  "),
+            Span::raw("  未merge UP:  "),
             Span::styled(
                 format!("Q={:.2}", s.ledger.position_up.qty),
                 Style::default().fg(Color::White),
@@ -971,7 +1069,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
             ),
         ]),
         Line::from(vec![
-            Span::raw("  DOWN: "),
+            Span::raw("  未merge DOWN: "),
             Span::styled(
                 format!("Q={:.2}", s.ledger.position_down.qty),
                 Style::default().fg(Color::White),
@@ -992,7 +1090,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
             ),
         ]),
         Line::from(vec![
-            Span::raw("  均价之和="),
+            Span::raw("  未merge均价和="),
             Span::styled(
                 format!("{:.2}", s.position_avg_sum()),
                 Style::default().fg(if s.position_avg_sum() < 1.0 {
@@ -1001,9 +1099,15 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                     Color::Yellow
                 }),
             ),
-            Span::raw("  IOC若成交="),
+            Span::raw("  pending若成交="),
             Span::styled(
-                format!("{:.2}", s.projected_avg_sum_after_intents()),
+                if s.ledger.maker_buy_intent_up.is_some()
+                    || s.ledger.maker_buy_intent_down.is_some()
+                {
+                    format!("{:.2}", s.projected_avg_sum_after_intents())
+                } else {
+                    "--".to_string()
+                },
                 Style::default().fg(if s.projected_avg_sum_after_intents() < 1.0 {
                     Color::Green
                 } else {
@@ -1072,7 +1176,12 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                 format!("{:.2}", s.ledger.merged_pairs),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::raw("  merge 实现盈亏="),
+            Span::raw(" (次="),
+            Span::styled(
+                format!("{}", s.ledger.merge_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(")  merge 实现盈亏="),
             Span::styled(
                 format!("{:+.4}", s.ledger.merge_pnl),
                 Style::default().fg(if s.ledger.merge_pnl >= 0.0 {
@@ -1102,42 +1211,31 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
             Span::raw("  (全周期 cash+inv-fee+返, redeem 已计入)  追涨侧="),
             Span::styled(chase_str, Style::default().fg(Color::Yellow)),
         ]),
-        Line::from({
-            let up_str = s
-                .ledger
-                .maker_buy_intent_up
-                .as_ref()
-                .map(|o| {
-                    format!(
-                        "UP @ {:.2}×{:.0}/{}",
-                        o.price,
-                        o.remaining_qty(),
-                        pending_reason_label(o.reason)
-                    )
-                })
-                .unwrap_or_else(|| "—".to_string());
-            let down_str = s
-                .ledger
-                .maker_buy_intent_down
-                .as_ref()
-                .map(|o| {
-                    format!(
-                        "DOWN @ {:.2}×{:.0}/{}",
-                        o.price,
-                        o.remaining_qty(),
-                        pending_reason_label(o.reason)
-                    )
-                })
-                .unwrap_or_else(|| "—".to_string());
-            vec![
-                Span::raw("  订单 "),
-                Span::styled("IOC买", Style::default().fg(Color::Cyan)),
-                Span::raw(": "),
-                Span::styled(up_str, Style::default().fg(Color::White)),
-                Span::raw("  "),
-                Span::styled(down_str, Style::default().fg(Color::White)),
-            ]
-        }),
+        Line::from(vec![
+            Span::raw("  本窗IOC买入 "),
+            Span::styled(
+                format!("UP {}", fill_side_summary(fills.up_qty, fills.up_vwap())),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "DOWN {}",
+                    fill_side_summary(fills.down_qty, fills.down_vwap())
+                ),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw("  成本="),
+            Span::styled(
+                format!("{:.2}", fills.total_notional()),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw("  fill档="),
+            Span::styled(
+                format!("{}", fills.fill_rows),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
         Line::from({
             let up_hint = s
                 .ledger
@@ -1197,6 +1295,15 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                     format!("{:.1}/{}", ioc.avg_levels(), ioc.fill_levels_max)
                 },
                 Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  最近IOC "),
+            Span::styled(
+                ioc.last_order(&s.ledger.order_history)
+                    .map(ioc_order_summary)
+                    .unwrap_or_else(|| "—".to_string()),
+                Style::default().fg(Color::White),
             ),
         ]),
         Line::from(vec![

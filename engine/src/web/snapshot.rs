@@ -10,7 +10,9 @@ use shared_types::{
     OrderbookView, PolyBook, PolyView, PositionSide, PositionView, TradeRow,
 };
 
-use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason};
+use crate::position::{
+    ManagedOrder, OrderStatus, PendingOrderReason, PositionSide as LedgerSide, TradeRecord,
+};
 use crate::tui::app::{AppState, BookLevel, ChaseSide};
 
 const POLY_BOOK_DEPTH: usize = 15;
@@ -89,6 +91,9 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
     let up_mid = s.poly_up_mid();
     let down_mid = s.poly_down_mid();
     let ioc = ioc_stats(&s.ledger.order_history);
+    let fills = window_fill_stats(&s.ledger.trades_current_window);
+    let projected_qty_up = s.projected_qty_up_after_intents();
+    let projected_qty_down = s.projected_qty_down_after_intents();
     let position = PositionView {
         up: PositionSide {
             qty: s.ledger.position_up.qty,
@@ -101,8 +106,19 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
             float_pnl: s.ledger.position_down.float_pnl(down_mid),
         },
         avg_sum: s.position_avg_sum(),
+        projected_avg_sum: if s.ledger.maker_buy_intent_up.is_some()
+            || s.ledger.maker_buy_intent_down.is_some()
+        {
+            Some(s.projected_avg_sum_after_intents())
+        } else {
+            None
+        },
+        projected_qty_up,
+        projected_qty_down,
+        projected_skew: projected_skew(projected_qty_up, projected_qty_down),
         mergeable_pairs: s.mergeable_pairs(),
         merged_pairs: s.ledger.merged_pairs,
+        merge_count: s.ledger.merge_count,
         merge_pnl: s.ledger.merge_pnl,
         realized_pnl: s.ledger.realized_pnl,
         total_fee: s.ledger.total_fee,
@@ -118,6 +134,12 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         rebalance_hint_down: s.ledger.rebalance_hint_down,
         maker_buy_intent_up: managed_order_tuple(s.ledger.maker_buy_intent_up.as_ref()),
         maker_buy_intent_down: managed_order_tuple(s.ledger.maker_buy_intent_down.as_ref()),
+        window_fill_rows: fills.fill_rows,
+        window_up_qty: fills.up_qty,
+        window_up_vwap: fills.up_vwap(),
+        window_down_qty: fills.down_qty,
+        window_down_vwap: fills.down_vwap(),
+        window_notional: fills.total_notional(),
         ioc_orders: ioc.orders,
         ioc_fill_rate: rate(ioc.filled_orders, ioc.orders),
         ioc_worst_breach_rate: rate(ioc.worst_breach, ioc.orders),
@@ -129,9 +151,14 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         },
         ioc_max_fill_levels: ioc.fill_levels_max,
         ioc_chase_orders: ioc.chase_orders,
+        ioc_chase_filled: ioc.chase_filled,
         ioc_chase_fill_rate: rate(ioc.chase_filled, ioc.chase_orders),
         ioc_rebal_orders: ioc.rebal_orders,
+        ioc_rebal_filled: ioc.rebal_filled,
         ioc_rebal_fill_rate: rate(ioc.rebal_filled, ioc.rebal_orders),
+        ioc_last_order: ioc
+            .last_order(&s.ledger.order_history)
+            .map(ioc_order_summary),
     };
 
     let fair_value = FairValueView {
@@ -206,6 +233,16 @@ fn managed_order_tuple(order: Option<&ManagedOrder>) -> Option<(f64, f64, i64)> 
     order.map(|o| (o.price, o.remaining_qty(), o.placed_ts_ms))
 }
 
+fn projected_skew(up_qty: f64, down_qty: f64) -> String {
+    if up_qty > down_qty {
+        "UP多".to_string()
+    } else if down_qty > up_qty {
+        "DOWN多".to_string()
+    } else {
+        "—".to_string()
+    }
+}
+
 #[derive(Default)]
 struct IocStats {
     orders: usize,
@@ -218,6 +255,12 @@ struct IocStats {
     chase_filled: usize,
     rebal_orders: usize,
     rebal_filled: usize,
+}
+
+impl IocStats {
+    fn last_order<'a>(&self, orders: &'a [ManagedOrder]) -> Option<&'a ManagedOrder> {
+        orders.iter().max_by_key(|o| o.updated_ts_ms)
+    }
 }
 
 fn ioc_stats(orders: &[ManagedOrder]) -> IocStats {
@@ -262,5 +305,93 @@ fn rate(part: usize, total: usize) -> f64 {
         0.0
     } else {
         part as f64 / total as f64
+    }
+}
+
+#[derive(Default)]
+struct WindowFillStats {
+    fill_rows: usize,
+    up_qty: f64,
+    up_notional: f64,
+    down_qty: f64,
+    down_notional: f64,
+}
+
+impl WindowFillStats {
+    fn up_vwap(&self) -> f64 {
+        if self.up_qty > 0.0 {
+            self.up_notional / self.up_qty
+        } else {
+            0.0
+        }
+    }
+
+    fn down_vwap(&self) -> f64 {
+        if self.down_qty > 0.0 {
+            self.down_notional / self.down_qty
+        } else {
+            0.0
+        }
+    }
+
+    fn total_notional(&self) -> f64 {
+        self.up_notional + self.down_notional
+    }
+}
+
+fn window_fill_stats(trades: &[TradeRecord]) -> WindowFillStats {
+    let mut stats = WindowFillStats::default();
+    for trade in trades.iter().filter(|t| t.buy_sell) {
+        stats.fill_rows += 1;
+        let notional = trade.price * trade.qty;
+        match trade.side {
+            LedgerSide::Up => {
+                stats.up_qty += trade.qty;
+                stats.up_notional += notional;
+            }
+            LedgerSide::Down => {
+                stats.down_qty += trade.qty;
+                stats.down_notional += notional;
+            }
+        }
+    }
+    stats
+}
+
+fn ioc_order_summary(order: &ManagedOrder) -> String {
+    let side = match order.side {
+        LedgerSide::Up => "UP",
+        LedgerSide::Down => "DOWN",
+    };
+    let reason = match order.reason {
+        PendingOrderReason::Chase => "chase",
+        PendingOrderReason::Rebalance => "rebal",
+    };
+    let status =
+        if order.filled_qty <= 0.0 && order.reject_reason.as_deref() == Some("worst_breach") {
+            "拒单"
+        } else if order.reject_reason.as_deref() == Some("ioc_remainder") {
+            "部分"
+        } else if order.filled_qty > 0.0 {
+            "成交"
+        } else {
+            "取消"
+        };
+    if order.filled_qty > 0.0 {
+        format!(
+            "{} {}/{} {:.0}/{:.0}张 VWAP={:.2} 档={}",
+            side,
+            status,
+            reason,
+            order.filled_qty,
+            order.qty,
+            order.vwap(),
+            order.fill_levels
+        )
+    } else {
+        format!(
+            "{} {}/{} 0/{:.0}张 worst={:.2}",
+            side, status, reason, order.qty, order.price
+        )
     }
 }

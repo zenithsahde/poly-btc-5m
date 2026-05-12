@@ -8,16 +8,13 @@
 ///   B) rebalance：偏仓配平锁 merge 套利（稳态也允许，无节流）
 ///
 /// 守门链（所有必须过）：
-///   1. poly_fresh    — Poly WS 新鲜，避免基于陈旧簿下单
-///   2. in_chase_window — 距窗口结束 ≥ 1.5min（末段不新建 chase 仓）
-///   3. force-balance — 只买"持仓 ≤ 对侧"的一边
-///   4. min qty       — ≥ 5 张（Polymarket 最低）
-///   5. pair-health   — 建仓腿 < 1.05 / 配平腿 < 0.98（均价之和）
-///   6. max buy price — target ≤ 0.85（防尾部 49:1 爆损）
+///   1. in_chase_window — 距窗口结束 ≥ 1.5min（末段不新建 chase 仓）
+///   2. force-balance — chase 只买"持仓 ≤ 对侧"的一边
+///   3. pair-health   — 建仓腿 < 1.05 / 配平腿 < 0.98（均价之和）
+///   4. max buy price — target ≤ 0.85（防尾部 49:1 爆损）
 ///
-/// worst_price 映射（IOC walk-the-book 的硬上限）：
-///   - chase     : min(target + CHASE_WORST_SLIPPAGE, MAX_BUY_PRICE)
-///   - rebalance : min((1 - opp.avg) - REBAL_WORST_HEAD_ROOM, MAX_BUY_PRICE)
+/// origin-compatible 模式下，策略层只决定 target；执行层只有在 taker fill 时用 target
+/// 作为走簿硬上限，不使用额外 worst slippage 改变信号。
 use crate::position::PendingOrderReason;
 use crate::strategy::fv::FvResult;
 use crate::tui::app::ChaseSide;
@@ -111,23 +108,21 @@ pub fn build_intents(
     let balance_ok_up = snap.qty_up <= snap.qty_down + th.force_balance_slack;
     let balance_ok_down = snap.qty_down <= snap.qty_up + th.force_balance_slack;
 
-    // chase 需要激变 + lead + force-balance + Poly 新鲜 + 1s 节流
+    // chase 需要激变 + lead + force-balance + 1s 节流（与 origin/main 一致，不加 poly_fresh 守门）
     let chase_buy_up = up_chase
         && balance_ok_up
         && in_excited
-        && snap.poly_fresh
         && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms;
     let chase_buy_down = down_chase
         && balance_ok_down
         && in_excited
-        && snap.poly_fresh
         && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms;
 
     // 偏仓配平：稳态也允许，无激变态/节流要求；窗口要求比 chase 宽，用来拯救已建偏仓。
     let imbalanced_up_needed = snap.qty_down > snap.qty_up;
     let imbalanced_dn_needed = snap.qty_up > snap.qty_down;
-    let rebalance_buy_up_path = imbalanced_up_needed && in_rebal_window && snap.poly_fresh;
-    let rebalance_buy_down_path = imbalanced_dn_needed && in_rebal_window && snap.poly_fresh;
+    let rebalance_buy_up_path = imbalanced_up_needed && in_rebal_window;
+    let rebalance_buy_down_path = imbalanced_dn_needed && in_rebal_window;
 
     // 计算配平缺口用于展示和 qty 裁剪
     let proj_up = snap.qty_up;
@@ -151,23 +146,17 @@ pub fn build_intents(
     let trigger_up = chase_buy_up || rebalance_buy_up_path;
     let trigger_down = chase_buy_down || rebalance_buy_down_path;
 
-    // chase 固定打基础仓位；rebalance 只补真实缺口，避免小偏仓时反向打过头
-    let order_qty_up = if chase_buy_up {
+    // origin/main：chase 与 rebalance 都按固定策略量下单；小偏仓也不裁剪为缺口量。
+    let order_qty_up = if chase_buy_up || rebalance_buy_up_path {
         th.chase_min_qty
-    } else if rebalance_buy_up_path {
-        rebalance_qty_up.min(th.chase_min_qty)
     } else {
         0.0
     };
-    let order_qty_down = if chase_buy_down {
+    let order_qty_down = if chase_buy_down || rebalance_buy_down_path {
         th.chase_min_qty
-    } else if rebalance_buy_down_path {
-        rebalance_qty_down.min(th.chase_min_qty)
     } else {
         0.0
     };
-    let qty_ok_up = order_qty_up >= th.min_order_qty;
-    let qty_ok_down = order_qty_down >= th.min_order_qty;
 
     // pair-health 守门：建仓腿宽松 1.05（对侧 ask proxy），配平腿严格 0.98（对侧真实 avg）
     let new_avg_up_after = if snap.qty_up + order_qty_up > 0.0 {
@@ -200,26 +189,13 @@ pub fn build_intents(
 
     let target_up = (fv.fair_up - th.safety_margin).max(0.0);
     let target_down = (fv.fair_down - th.safety_margin).max(0.0);
-    let want_buy_up = trigger_up
-        && qty_ok_up
-        && pair_health_ok_up
-        && target_up > 0.0
-        && target_up <= th.max_buy_price;
-    let want_buy_down = trigger_down
-        && qty_ok_down
-        && pair_health_ok_down
-        && target_down > 0.0
-        && target_down <= th.max_buy_price;
+    let want_buy_up =
+        trigger_up && pair_health_ok_up && target_up > 0.0 && target_up <= th.max_buy_price;
+    let want_buy_down =
+        trigger_down && pair_health_ok_down && target_down > 0.0 && target_down <= th.max_buy_price;
 
     let mut intents: Vec<BuyIntent> = Vec::with_capacity(2);
     if want_buy_up {
-        let worst_up = if chase_buy_up {
-            (target_up + th.chase_worst_slippage).min(th.max_buy_price)
-        } else if snap.avg_down > 0.0 {
-            ((1.0 - snap.avg_down) - th.rebal_worst_head_room).min(th.max_buy_price)
-        } else {
-            (target_up + th.chase_worst_slippage).min(th.max_buy_price)
-        };
         let reason = if chase_buy_up {
             PendingOrderReason::Chase
         } else {
@@ -229,19 +205,12 @@ pub fn build_intents(
             side: ChaseSide::Up,
             qty: order_qty_up,
             target: target_up,
-            worst: worst_up,
+            worst: target_up,
             reason,
             rebalance_hint: None,
         });
     }
     if want_buy_down {
-        let worst_down = if chase_buy_down {
-            (target_down + th.chase_worst_slippage).min(th.max_buy_price)
-        } else if snap.avg_up > 0.0 {
-            ((1.0 - snap.avg_up) - th.rebal_worst_head_room).min(th.max_buy_price)
-        } else {
-            (target_down + th.chase_worst_slippage).min(th.max_buy_price)
-        };
         let reason = if chase_buy_down {
             PendingOrderReason::Chase
         } else {
@@ -251,7 +220,7 @@ pub fn build_intents(
             side: ChaseSide::Down,
             qty: order_qty_down,
             target: target_down,
-            worst: worst_down,
+            worst: target_down,
             reason,
             rebalance_hint: None,
         });

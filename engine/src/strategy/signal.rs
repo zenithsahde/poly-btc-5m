@@ -88,6 +88,8 @@ const SAFETY_MARGIN: f64 = 0.05;
 /// v0.4.13 配平腿专用 margin：target = (1 - opp.avg) - REBALANCE_MARGIN
 /// 配平腿不抓 lead alpha，只锁套利空间。0.02 = 留 2c 给 fee + 滑点，余下确定净利。
 const REBALANCE_MARGIN: f64 = 0.02;
+/// Origin-compatible fill mode：挂单超过此时间未 fill → cancel。
+const MAKER_TIMEOUT_MS: i64 = 5000;
 /// v0.4.15 IOC walk-the-book：chase 腿允许吃簿到 target + 此滑点（cent）。
 /// 上限来自 CHASE_GAP_MIN(10c) - SAFETY_MARGIN(5c) = 5c 容差，砍一半给未来反弹空间。
 const CHASE_WORST_SLIPPAGE: f64 = 0.03;
@@ -136,6 +138,114 @@ pub struct SignalEngine {
     /// v0.4.5: 同侧 taker buy 节流时间戳
     last_taker_up_ts_ms: i64,
     last_taker_down_ts_ms: i64,
+}
+
+fn execute_origin_compatible_intent(
+    s: &mut AppState,
+    intent: &decision::BuyIntent,
+    now_ms: i64,
+) -> bool {
+    if s.ledger.has_open_buy_order(intent.side) {
+        return false;
+    }
+
+    let ask = match intent.side {
+        ChaseSide::Up => s.poly_best_ask,
+        ChaseSide::Down => s.poly_down_best_ask,
+    };
+
+    if ask > 0.0 && ask <= intent.target {
+        let out = execute_ioc_buy(
+            s,
+            intent.side,
+            intent.qty,
+            intent.target,
+            intent.target,
+            intent.reason,
+            now_ms,
+        );
+        out.filled_qty > 0.0
+    } else {
+        let mut order = s.ledger.create_managed_buy_order(
+            intent.side,
+            intent.target,
+            intent.qty,
+            now_ms,
+            intent.reason,
+        );
+        order.target_price = intent.target;
+        match intent.side {
+            ChaseSide::Up => s.ledger.maker_buy_intent_up = Some(order),
+            ChaseSide::Down => s.ledger.maker_buy_intent_down = Some(order),
+        }
+        false
+    }
+}
+
+fn match_origin_pending_orders(
+    s: &mut AppState,
+    target_up: f64,
+    target_down: f64,
+    now_ms: i64,
+) -> (bool, bool) {
+    let up_filled = match_origin_pending_order(s, ChaseSide::Up, target_up, now_ms);
+    let down_filled = match_origin_pending_order(s, ChaseSide::Down, target_down, now_ms);
+    (up_filled, down_filled)
+}
+
+fn match_origin_pending_order(
+    s: &mut AppState,
+    side: ChaseSide,
+    current_target: f64,
+    now_ms: i64,
+) -> bool {
+    let mut order = match side {
+        ChaseSide::Up => s.ledger.maker_buy_intent_up.take(),
+        ChaseSide::Down => s.ledger.maker_buy_intent_down.take(),
+    };
+    let Some(mut order) = order.take() else {
+        return false;
+    };
+
+    let (ub, ua, db, da) = (
+        s.poly_best_bid,
+        s.poly_best_ask,
+        s.poly_down_best_bid,
+        s.poly_down_best_ask,
+    );
+    let ask = match side {
+        ChaseSide::Up => ua,
+        ChaseSide::Down => da,
+    };
+
+    if ask > 0.0 && ask <= order.price {
+        let fill_price = order.price;
+        let fill_qty = order.remaining_qty();
+        s.apply_fill(
+            side, true, true, fill_price, fill_qty, now_ms, ub, ua, db, da,
+        );
+        order.record_fill_at(fill_qty, fill_price, now_ms);
+        s.ledger.order_history.push(order);
+        return true;
+    }
+
+    if now_ms - order.placed_ts_ms > MAKER_TIMEOUT_MS {
+        order.mark_expired(now_ms);
+        s.ledger.order_history.push(order);
+        return false;
+    }
+
+    if current_target > 0.0 && (current_target - order.price).abs() >= REPRICE_TICK_THRESH {
+        order.mark_cancelled(now_ms);
+        s.ledger.order_history.push(order);
+        return false;
+    }
+
+    match side {
+        ChaseSide::Up => s.ledger.maker_buy_intent_up = Some(order),
+        ChaseSide::Down => s.ledger.maker_buy_intent_down = Some(order),
+    }
+    false
 }
 
 impl SignalEngine {
@@ -413,8 +523,24 @@ impl SignalEngine {
                     },
                 );
             }
-            // 步骤 C：一次 read 装填 decision 所需的市场快照
+
             let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Ok(mut s) = self.state.write() {
+                let pending_fills = match_origin_pending_orders(
+                    &mut s,
+                    (fair_p - SAFETY_MARGIN).max(0.0),
+                    (fair_down - SAFETY_MARGIN).max(0.0),
+                    now_ms,
+                );
+                if pending_fills.0 {
+                    self.last_taker_up_ts_ms = now_ms;
+                }
+                if pending_fills.1 {
+                    self.last_taker_down_ts_ms = now_ms;
+                }
+            }
+
+            // 步骤 C：一次 read 装填 decision 所需的市场快照
             let snap = if let Ok(s) = self.state.read() {
                 let up_mid = if s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0 {
                     (s.poly_best_bid + s.poly_best_ask) / 2.0
@@ -485,22 +611,13 @@ impl SignalEngine {
                 self.last_taker_down_ts_ms,
             );
 
-            // 步骤 E：写展示副作用 + 执行 IOC walk-the-book
+            // 步骤 E：写展示副作用 + origin-compatible target fill / pending maker
             if let Ok(mut s) = self.state.write() {
                 s.chase_side = effects.chase_side;
                 s.ledger.rebalance_hint_up = effects.rebalance_hint_up;
                 s.ledger.rebalance_hint_down = effects.rebalance_hint_down;
                 for intent in &intents {
-                    let out = execute_ioc_buy(
-                        &mut *s,
-                        intent.side,
-                        intent.qty,
-                        intent.target,
-                        intent.worst,
-                        intent.reason,
-                        now_ms,
-                    );
-                    if out.filled_qty > 0.0 {
+                    if execute_origin_compatible_intent(&mut s, intent, now_ms) {
                         match intent.side {
                             ChaseSide::Up => self.last_taker_up_ts_ms = now_ms,
                             ChaseSide::Down => self.last_taker_down_ts_ms = now_ms,
@@ -635,14 +752,9 @@ impl SignalEngine {
 
             // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
             let ts_ms = chrono::Utc::now().timestamp_millis();
-            let (up_bid, up_ask, down_bid, down_ask) = (
-                s.poly_best_bid,
-                s.poly_best_ask,
-                s.poly_down_best_bid,
-                s.poly_down_best_ask,
-            );
-            // v0.4.15 IOC：不再有 maker resting，PolyBookUpdate 不需要处理 pending fill。
-            let _ = (up_bid, up_ask, down_bid, down_ask);
+            let target_up = (s.fair_price - SAFETY_MARGIN).max(0.0);
+            let target_down = (s.fair_price_down - SAFETY_MARGIN).max(0.0);
+            match_origin_pending_orders(&mut s, target_up, target_down, ts_ms);
 
             // v0.4.0-5m：虚拟 merge 触发（替代旧浮亏 sell 减仓）
             //   底层逻辑：1 UP + 1 DOWN ≡ 1 USDC（Polymarket CTF mergePositions 任意时刻可调）

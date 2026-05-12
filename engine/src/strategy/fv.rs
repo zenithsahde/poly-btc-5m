@@ -98,10 +98,10 @@ impl FvEngine {
         let iv_poly =
             bs_model::find_implied_volatility(inp.binance_mid, inp.strike, t_years, inp.poly_p);
 
-        let fv_up_rising = is_rising(&self.fv_up_history, fair_up);
-        let fv_down_rising = is_rising(&self.fv_down_history, fair_down);
         push_truncate(&mut self.fv_up_history, fair_up, FV_HISTORY_LEN);
         push_truncate(&mut self.fv_down_history, fair_down, FV_HISTORY_LEN);
+        let fv_up_rising = is_rising(&self.fv_up_history, fair_up);
+        let fv_down_rising = is_rising(&self.fv_down_history, fair_down);
 
         FvResult {
             fair_up,

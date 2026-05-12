@@ -260,6 +260,8 @@ pub struct PositionLedger {
     pub next_order_id: u64,
     /// 累计已虚拟 merge 的对数（每对兑换 1.00 USDC）
     pub merged_pairs: f64,
+    /// 累计 apply_merge 被实际执行的次数（pq>0 才计）；用于区分"对数"与"调用次数"
+    pub merge_count: u64,
     /// Merge 实现盈亏 = Σ pair_qty × (1.00 - (avg_up + avg_down))
     pub merge_pnl: f64,
     /// Merge 收到的现金（USDC）= merged_pairs × 1.00
@@ -430,6 +432,7 @@ impl PositionLedger {
         self.merge_pnl += pq * (1.00 - avg_sum);
         self.cash_received += pq * 1.00;
         self.merged_pairs += pq;
+        self.merge_count = self.merge_count.saturating_add(1);
         self.position_up.qty = (self.position_up.qty - pq).max(0.0);
         self.position_down.qty = (self.position_down.qty - pq).max(0.0);
         if self.position_up.qty <= 0.0 {
