@@ -27,7 +27,24 @@ use ratatui::{
 };
 use std::sync::RwLock;
 
-use crate::tui::app::{ChaseSide, AppState};
+use crate::position::{ManagedOrder, PendingOrderReason};
+use crate::tui::app::{AppState, ChaseSide};
+
+fn pending_reason_label(reason: PendingOrderReason) -> &'static str {
+    match reason {
+        PendingOrderReason::Chase => "chase",
+        PendingOrderReason::Rebalance => "rebal",
+    }
+}
+
+fn format_pending_buy(order: &ManagedOrder) -> String {
+    format!(
+        "买@{:.2}×{:.0}/{}",
+        order.price,
+        order.remaining_qty(),
+        pending_reason_label(order.reason)
+    )
+}
 
 /// 主渲染函数：标题 + 左侧 Binance（订单簿+成交+延迟）+ 右侧 Poly Up/Down 双订单簿 + 状态栏
 /// v0.4.9: snapshot-clone 模式 — 持锁仅 ~微秒，立即释放后再绘制，消除与 signal.rs write 锁竞争
@@ -140,30 +157,68 @@ fn render_orderbook(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rect
     let w_qty = 10;
 
     let header = Row::new(vec![
-        Cell::from(format!("{:>w_price$}", "卖价")).style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
-        Cell::from(format!("{:>w_qty$}", "数量")).style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Cell::from(format!("{:>w_price$}", "卖价")).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from(format!("{:>w_qty$}", "数量")).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
-    let ask_rows: Vec<Row> = s.asks.iter().rev().take(8).map(|lv| {
-        Row::new(vec![
-            Cell::from(format!("{:>w_price$.2}", lv.price)).style(Style::default().fg(Color::Red)),
-            Cell::from(format!("{:>w_qty$.4}", lv.qty)).style(Style::default().fg(Color::White)),
-        ])
-    }).collect();
+    let ask_rows: Vec<Row> = s
+        .asks
+        .iter()
+        .rev()
+        .take(8)
+        .map(|lv| {
+            Row::new(vec![
+                Cell::from(format!("{:>w_price$.2}", lv.price))
+                    .style(Style::default().fg(Color::Red)),
+                Cell::from(format!("{:>w_qty$.4}", lv.qty))
+                    .style(Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
     let mid_row = Row::new(vec![
-        Cell::from(format!("{:>w_price$.2} │ {:>w_price$.2}", s.best_bid, s.best_ask))
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Cell::from(format!(
+            "{:>w_price$.2} │ {:>w_price$.2}",
+            s.best_bid, s.best_ask
+        ))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Cell::from("── mid ──").style(Style::default().fg(Color::DarkGray)),
     ]);
     let bid_header = Row::new(vec![
-        Cell::from(format!("{:>w_price$}", "买价")).style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
-        Cell::from(format!("{:>w_qty$}", "数量")).style(Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Cell::from(format!("{:>w_price$}", "买价")).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from(format!("{:>w_qty$}", "数量")).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
-    let bid_rows: Vec<Row> = s.bids.iter().take(8).map(|lv| {
-        Row::new(vec![
-            Cell::from(format!("{:>w_price$.2}", lv.price)).style(Style::default().fg(Color::Green)),
-            Cell::from(format!("{:>w_qty$.4}", lv.qty)).style(Style::default().fg(Color::White)),
-        ])
-    }).collect();
+    let bid_rows: Vec<Row> = s
+        .bids
+        .iter()
+        .take(8)
+        .map(|lv| {
+            Row::new(vec![
+                Cell::from(format!("{:>w_price$.2}", lv.price))
+                    .style(Style::default().fg(Color::Green)),
+                Cell::from(format!("{:>w_qty$.4}", lv.qty))
+                    .style(Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
 
     let mut rows = vec![header];
     rows.extend(ask_rows);
@@ -171,7 +226,14 @@ fn render_orderbook(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rect
     rows.push(bid_header);
     rows.extend(bid_rows);
 
-    let table = Table::new(rows, [Constraint::Length((w_price + 2) as u16), Constraint::Length((w_qty + 2) as u16)]).column_spacing(1);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length((w_price + 2) as u16),
+            Constraint::Length((w_qty + 2) as u16),
+        ],
+    )
+    .column_spacing(1);
     frame.render_widget(table, inner);
 }
 
@@ -345,7 +407,8 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     } else {
         Span::styled("○", Style::default().fg(Color::Red))
     };
-    let secs = crate::ws::discovery::MarketDiscovery::seconds_until_next_window(s.poly_window_end_ts);
+    let secs =
+        crate::ws::discovery::MarketDiscovery::seconds_until_next_window(s.poly_window_end_ts);
     let countdown = format!("{}m {}s", secs / 60, secs % 60);
     let delay_str = s
         .poly_delay_ms()
@@ -362,11 +425,21 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
             Span::raw(" 📗 Poly 5m  "),
             conn,
             Span::raw(" "),
-            Span::styled(s.poly_market_slug.as_str(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                s.poly_market_slug.as_str(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  |  切换: "),
             Span::styled(countdown.as_str(), Style::default().fg(Color::Yellow)),
             Span::raw("  |  Poly延迟: "),
-            Span::styled(delay_str.as_str(), Style::default().fg(delay_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                delay_str.as_str(),
+                Style::default()
+                    .fg(delay_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta));
@@ -375,8 +448,8 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     frame.render_widget(block, area);
 
     // 挂单信息：用于在订单簿档位打标及底部汇总
-    let up_buy = s.maker_buy_intent_up;
-    let down_buy = s.maker_buy_intent_down;
+    let up_buy = s.ledger.maker_buy_intent_up.as_ref();
+    let down_buy = s.ledger.maker_buy_intent_down.as_ref();
     // v0.4.0-5m：sell 全部废弃，挂单只剩 maker buy（卖侧用 merge 退出）
     let up_sell: Option<(f64, f64)> = None;
     let down_sell: Option<(f64, f64)> = None;
@@ -390,17 +463,35 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
         .split(inner);
 
     // Spread = best_ask - best_bid；asks 存升序(best=first)，bids 存降序(best=first)
-    let up_spr = s.poly_asks.first().zip(s.poly_bids.first())
+    let up_spr = s
+        .poly_asks
+        .first()
+        .zip(s.poly_bids.first())
         .map(|(a, b)| (a.price - b.price).max(0.0))
         .unwrap_or_else(|| (s.poly_best_ask - s.poly_best_bid).max(0.0));
-    let down_spr = s.poly_down_asks.first().zip(s.poly_down_bids.first())
+    let down_spr = s
+        .poly_down_asks
+        .first()
+        .zip(s.poly_down_bids.first())
         .map(|(a, b)| (a.price - b.price).max(0.0))
         .unwrap_or_else(|| (s.poly_down_best_ask - s.poly_down_best_bid).max(0.0));
 
     let header = Row::new(vec![
-        Cell::from("  Up 价   量  ").style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Cell::from("    Last   Spread   ").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Cell::from("  Down 价   量  ").style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Cell::from("  Up 价   量  ").style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("    Last   Spread   ").style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("  Down 价   量  ").style(
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     let mut rows = vec![header];
 
@@ -408,28 +499,57 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     // 卖盘(Asks)：我们的挂卖在该档则打标 ←卖×数量
     for i in 0..n {
         let idx = n - 1 - i;
-        let (up_s, up_our) = s.poly_asks.get(idx).map(|l| {
-            let our = up_sell.map(|(p, q)| near(l.price, p)).unwrap_or(false);
-            let s = if our {
-                format!("{:>5.2} {:>7.2} ←卖×{}", l.price, l.qty, up_sell.unwrap().1)
-            } else {
-                format!("{:>5.2} {:>7.2}", l.price, l.qty)
-            };
-            (s, our)
-        }).unwrap_or_else(|| ("   —     —   ".to_string(), false));
-        let (down_s, down_our) = s.poly_down_asks.get(idx).map(|l| {
-            let our = down_sell.map(|(p, _)| near(l.price, p)).unwrap_or(false);
-            let s = if our {
-                format!("{:>5.2} {:>7.2} ←卖×{}", l.price, l.qty, down_sell.unwrap().1)
-            } else {
-                format!("{:>5.2} {:>7.2}", l.price, l.qty)
-            };
-            (s, our)
-        }).unwrap_or_else(|| ("   —     —   ".to_string(), false));
+        let (up_s, up_our) = s
+            .poly_asks
+            .get(idx)
+            .map(|l| {
+                let our = up_sell.map(|(p, q)| near(l.price, p)).unwrap_or(false);
+                let s = if our {
+                    format!("{:>5.2} {:>7.2} ←卖×{}", l.price, l.qty, up_sell.unwrap().1)
+                } else {
+                    format!("{:>5.2} {:>7.2}", l.price, l.qty)
+                };
+                (s, our)
+            })
+            .unwrap_or_else(|| ("   —     —   ".to_string(), false));
+        let (down_s, down_our) = s
+            .poly_down_asks
+            .get(idx)
+            .map(|l| {
+                let our = down_sell.map(|(p, _)| near(l.price, p)).unwrap_or(false);
+                let s = if our {
+                    format!(
+                        "{:>5.2} {:>7.2} ←卖×{}",
+                        l.price,
+                        l.qty,
+                        down_sell.unwrap().1
+                    )
+                } else {
+                    format!("{:>5.2} {:>7.2}", l.price, l.qty)
+                };
+                (s, our)
+            })
+            .unwrap_or_else(|| ("   —     —   ".to_string(), false));
         rows.push(Row::new(vec![
-            Cell::from(up_s).style(Style::default().fg(if up_our { Color::Yellow } else { Color::Red }).add_modifier(if up_our { Modifier::BOLD } else { Modifier::empty() })),
+            Cell::from(up_s).style(
+                Style::default()
+                    .fg(if up_our { Color::Yellow } else { Color::Red })
+                    .add_modifier(if up_our {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
             Cell::from("").style(Style::default().fg(Color::DarkGray)),
-            Cell::from(down_s).style(Style::default().fg(if down_our { Color::Yellow } else { Color::Red }).add_modifier(if down_our { Modifier::BOLD } else { Modifier::empty() })),
+            Cell::from(down_s).style(
+                Style::default()
+                    .fg(if down_our { Color::Yellow } else { Color::Red })
+                    .add_modifier(if down_our {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
         ]));
     }
     // 中间一行：Last / Spread 与数值同列对齐，左右分隔线
@@ -444,35 +564,89 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     ]));
     // 买盘(Bids)：我们的挂买在该档则打标 ←买×1
     for i in 0..n {
-        let (up_s, up_our) = s.poly_bids.get(i).map(|l| {
-            let our = up_buy.map(|(p, _, _)| near(l.price, p)).unwrap_or(false);
-            let s = if our { format!("{:>5.2} {:>7.2} ←买×{}", l.price, l.qty, up_buy.map(|(_, q, _)| q).unwrap_or(1.0)) } else { format!("{:>5.2} {:>7.2}", l.price, l.qty) };
-            (s, our)
-        }).unwrap_or_else(|| ("   —     —   ".to_string(), false));
-        let (down_s, down_our) = s.poly_down_bids.get(i).map(|l| {
-            let our = down_buy.map(|(p, _, _)| near(l.price, p)).unwrap_or(false);
-            let s = if our { format!("{:>5.2} {:>7.2} ←买×{}", l.price, l.qty, down_buy.map(|(_, q, _)| q).unwrap_or(1.0)) } else { format!("{:>5.2} {:>7.2}", l.price, l.qty) };
-            (s, our)
-        }).unwrap_or_else(|| ("   —     —   ".to_string(), false));
+        let (up_s, up_our) = s
+            .poly_bids
+            .get(i)
+            .map(|l| {
+                let our = up_buy.map(|o| near(l.price, o.price)).unwrap_or(false);
+                let s = if our {
+                    format!(
+                        "{:>5.2} {:>7.2} ←买×{}",
+                        l.price,
+                        l.qty,
+                        up_buy.map(|o| o.remaining_qty()).unwrap_or(1.0)
+                    )
+                } else {
+                    format!("{:>5.2} {:>7.2}", l.price, l.qty)
+                };
+                (s, our)
+            })
+            .unwrap_or_else(|| ("   —     —   ".to_string(), false));
+        let (down_s, down_our) = s
+            .poly_down_bids
+            .get(i)
+            .map(|l| {
+                let our = down_buy.map(|o| near(l.price, o.price)).unwrap_or(false);
+                let s = if our {
+                    format!(
+                        "{:>5.2} {:>7.2} ←买×{}",
+                        l.price,
+                        l.qty,
+                        down_buy.map(|o| o.remaining_qty()).unwrap_or(1.0)
+                    )
+                } else {
+                    format!("{:>5.2} {:>7.2}", l.price, l.qty)
+                };
+                (s, our)
+            })
+            .unwrap_or_else(|| ("   —     —   ".to_string(), false));
         rows.push(Row::new(vec![
-            Cell::from(up_s).style(Style::default().fg(if up_our { Color::Cyan } else { Color::Green }).add_modifier(if up_our { Modifier::BOLD } else { Modifier::empty() })),
+            Cell::from(up_s).style(
+                Style::default()
+                    .fg(if up_our { Color::Cyan } else { Color::Green })
+                    .add_modifier(if up_our {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
             Cell::from("").style(Style::default().fg(Color::DarkGray)),
-            Cell::from(down_s).style(Style::default().fg(if down_our { Color::Cyan } else { Color::Green }).add_modifier(if down_our { Modifier::BOLD } else { Modifier::empty() })),
+            Cell::from(down_s).style(
+                Style::default()
+                    .fg(if down_our { Color::Cyan } else { Color::Green })
+                    .add_modifier(if down_our {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
         ]));
     }
 
-    let table = Table::new(rows, [
-        Constraint::Percentage(35),
-        Constraint::Length(48),
-        Constraint::Percentage(35),
-    ]).column_spacing(1);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(35),
+            Constraint::Length(48),
+            Constraint::Percentage(35),
+        ],
+    )
+    .column_spacing(1);
     frame.render_widget(table, inner_split[0]);
 
     // 底部挂单汇总：方向、价格、数量
-    let up_buy_str = up_buy.map(|(p, q, _)| format!("买@{:.2}×{:.0}", p, q)).unwrap_or_else(|| "买—".to_string());
-    let up_sell_str = up_sell.map(|(p, q)| format!("卖@{:.2}×{:.2}", p, q)).unwrap_or_else(|| "卖—".to_string());
-    let down_buy_str = down_buy.map(|(p, q, _)| format!("买@{:.2}×{:.0}", p, q)).unwrap_or_else(|| "买—".to_string());
-    let down_sell_str = down_sell.map(|(p, q)| format!("卖@{:.2}×{:.2}", p, q)).unwrap_or_else(|| "卖—".to_string());
+    let up_buy_str = up_buy
+        .map(format_pending_buy)
+        .unwrap_or_else(|| "买—".to_string());
+    let up_sell_str = up_sell
+        .map(|(p, q)| format!("卖@{:.2}×{:.2}", p, q))
+        .unwrap_or_else(|| "卖—".to_string());
+    let down_buy_str = down_buy
+        .map(format_pending_buy)
+        .unwrap_or_else(|| "买—".to_string());
+    let down_sell_str = down_sell
+        .map(|(p, q)| format!("卖@{:.2}×{:.2}", p, q))
+        .unwrap_or_else(|| "卖—".to_string());
     let footer_text = Line::from(vec![
         Span::styled(" 挂单 ", Style::default().fg(Color::DarkGray)),
         Span::styled("Up ", Style::default().fg(Color::Green)),
@@ -499,7 +673,8 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let secs = crate::ws::discovery::MarketDiscovery::seconds_until_next_window(s.poly_window_end_ts);
+    let secs =
+        crate::ws::discovery::MarketDiscovery::seconds_until_next_window(s.poly_window_end_ts);
     let countdown = format!("{}m {}s", secs / 60, secs % 60);
     let window_end_str: String = if s.poly_window_end_ts > 0 {
         chrono::Utc
@@ -523,28 +698,58 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
             Span::raw("窗口结束: "),
             Span::styled(window_end_str, Style::default().fg(Color::Cyan)),
             Span::raw("  切换: "),
-            Span::styled(countdown.as_str(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                countdown.as_str(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("  S(mid)="),
-            Span::styled(format!("{:.2}", s.mid_price), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.2}", s.mid_price),
+                Style::default().fg(Color::White),
+            ),
             Span::raw("  K="),
-            Span::styled(format!("{:.0}", s.strike_price), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.0}", s.strike_price),
+                Style::default().fg(Color::White),
+            ),
             Span::raw("  T="),
-            Span::styled(format!("{:.1}min", s.expiry_minutes), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.1}min", s.expiry_minutes),
+                Style::default().fg(Color::White),
+            ),
             Span::raw("  σ="),
-            Span::styled(format!("{:.1}%", s.volatility_annual * 100.0), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{:.1}%", s.volatility_annual * 100.0),
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::raw("  FV_up="),
-            Span::styled(format!("{:.2}", s.fair_price), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:.2}", s.fair_price),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  FV_down="),
-            Span::styled(format!("{:.2}", s.fair_price_down), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:.2}", s.fair_price_down),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::raw("  偏差="),
-            Span::styled(format!("{:.0} bps", s.signal_gap_bps), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:.0} bps", s.signal_gap_bps),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw("  Poly IV="),
             Span::styled(
                 if s.iv_poly >= 2.0 {
@@ -561,14 +766,24 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
         Line::from(vec![
             Span::styled(t_status, Style::default().fg(Color::Cyan)),
             Span::raw("  状态: "),
-            Span::styled(s.market_state.as_str(), Style::default().fg(if s.market_state == "稳态" { Color::Green } else { Color::Yellow })),
+            Span::styled(
+                s.market_state.as_str(),
+                Style::default().fg(if s.market_state == "稳态" {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
             Span::raw("  "),
             Span::styled(&sigma_status, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("  正延迟(FV先): "),
-            Span::styled(format!("n={} ", s.delay_stats.count_pos), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("n={} ", s.delay_stats.count_pos),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw("min="),
             Span::styled(
                 if s.delay_stats.count_pos > 0 {
@@ -590,7 +805,10 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
             Span::raw(" avg="),
             Span::styled(
                 if s.delay_stats.count_pos > 0 {
-                    format!("{:.0}ms", s.delay_stats.sum_pos_ms / s.delay_stats.count_pos as f64)
+                    format!(
+                        "{:.0}ms",
+                        s.delay_stats.sum_pos_ms / s.delay_stats.count_pos as f64
+                    )
                 } else {
                     "—".to_string()
                 },
@@ -599,7 +817,10 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
         ]),
         Line::from(vec![
             Span::raw("  负延迟(Poly先): "),
-            Span::styled(format!("n={} ", s.delay_stats.count_neg), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("n={} ", s.delay_stats.count_neg),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw("min="),
             Span::styled(
                 if s.delay_stats.count_neg > 0 {
@@ -621,7 +842,10 @@ fn render_fair_value_panel(frame: &mut Frame, s: &AppState, area: ratatui::layou
             Span::raw(" avg="),
             Span::styled(
                 if s.delay_stats.count_neg > 0 {
-                    format!("{:.0}ms", s.delay_stats.sum_neg_ms / s.delay_stats.count_neg as f64)
+                    format!(
+                        "{:.0}ms",
+                        s.delay_stats.sum_neg_ms / s.delay_stats.count_neg as f64
+                    )
                 } else {
                     "—".to_string()
                 },
@@ -646,8 +870,8 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
 
     let up_mid = s.poly_up_mid();
     let down_mid = s.poly_down_mid();
-    let float_up = s.position_up.float_pnl(up_mid);
-    let float_down = s.position_down.float_pnl(down_mid);
+    let float_up = s.ledger.position_up.float_pnl(up_mid);
+    let float_down = s.ledger.position_down.float_pnl(down_mid);
     let chase_str = match s.chase_side {
         Some(ChaseSide::Up) => "UP",
         Some(ChaseSide::Down) => "DOWN",
@@ -657,35 +881,65 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
     let text = Text::from(vec![
         Line::from(vec![
             Span::raw("  UP:  "),
-            Span::styled(format!("Q={:.2}", s.position_up.qty), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("Q={:.2}", s.ledger.position_up.qty),
+                Style::default().fg(Color::White),
+            ),
             Span::raw("  P_avg="),
-            Span::styled(format!("{:.2}", s.position_up.avg_price), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:.2}", s.ledger.position_up.avg_price),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw("  浮盈/亏="),
             Span::styled(
                 format!("{:.4}", float_up),
-                Style::default().fg(if float_up >= 0.0 { Color::Green } else { Color::Red }),
+                Style::default().fg(if float_up >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
             ),
         ]),
         Line::from(vec![
             Span::raw("  DOWN: "),
-            Span::styled(format!("Q={:.2}", s.position_down.qty), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("Q={:.2}", s.ledger.position_down.qty),
+                Style::default().fg(Color::White),
+            ),
             Span::raw("  P_avg="),
-            Span::styled(format!("{:.2}", s.position_down.avg_price), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:.2}", s.ledger.position_down.avg_price),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw("  浮盈/亏="),
             Span::styled(
                 format!("{:.4}", float_down),
-                Style::default().fg(if float_down >= 0.0 { Color::Green } else { Color::Red }),
+                Style::default().fg(if float_down >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
             ),
         ]),
         Line::from(vec![
             Span::raw("  均价之和="),
             Span::styled(
                 format!("{:.2}", s.position_avg_sum()),
-                Style::default().fg(if s.position_avg_sum() < 1.0 { Color::Green } else { Color::Yellow })),
+                Style::default().fg(if s.position_avg_sum() < 1.0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
             Span::raw("  挂单若成交="),
             Span::styled(
                 format!("{:.2}", s.projected_avg_sum_after_intents()),
-                Style::default().fg(if s.projected_avg_sum_after_intents() < 1.0 { Color::Green } else { Color::Yellow })),
+                Style::default().fg(if s.projected_avg_sum_after_intents() < 1.0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
             Span::raw(" (应<1)  偏仓="),
             Span::styled(
                 {
@@ -705,47 +959,106 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
         // v0.4.0-5m P&L 面板（merge 模型）
         Line::from(vec![
             Span::raw("  💰 现金 cash="),
-            Span::styled(format!("{:+.4}", s.cash_pnl()),
-                Style::default().fg(if s.cash_pnl() >= 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(
+                format!("{:+.4}", s.cash_pnl()),
+                Style::default().fg(if s.cash_pnl() >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
             Span::raw(" (paid -"),
-            Span::styled(format!("{:.2}", s.cash_paid), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{:.2}", s.ledger.cash_paid),
+                Style::default().fg(Color::Red),
+            ),
             Span::raw(", received +"),
-            Span::styled(format!("{:.2}", s.cash_received), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.2}", s.ledger.cash_received),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw(")"),
         ]),
         Line::from(vec![
             Span::raw("  📦 库存 inventory="),
-            Span::styled(format!("{:+.4}", s.inventory_value()),
-                Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:+.4}", s.inventory_value()),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw("  Taker费=-"),
-            Span::styled(format!("{:.4}", s.total_fee), Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{:.4}", s.ledger.total_fee),
+                Style::default().fg(Color::Red),
+            ),
             Span::raw("  Maker返佣=+"),
-            Span::styled(format!("{:.4}", s.total_rebate), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.4}", s.ledger.total_rebate),
+                Style::default().fg(Color::Green),
+            ),
         ]),
         Line::from(vec![
             Span::raw("  🔀 已 merge 对数="),
-            Span::styled(format!("{:.2}", s.merged_pairs), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format!("{:.2}", s.ledger.merged_pairs),
+                Style::default().fg(Color::Magenta),
+            ),
             Span::raw("  merge 实现盈亏="),
-            Span::styled(format!("{:+.4}", s.merge_pnl),
-                Style::default().fg(if s.merge_pnl >= 0.0 { Color::Green } else { Color::Red })),
+            Span::styled(
+                format!("{:+.4}", s.ledger.merge_pnl),
+                Style::default().fg(if s.ledger.merge_pnl >= 0.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
+            ),
             Span::raw("  可 merge 对数="),
-            Span::styled(format!("{:.2}", s.mergeable_pairs()),
-                Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:.2}", s.mergeable_pairs()),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
         Line::from(vec![
             Span::raw("  📊 累计净盈亏="),
             Span::styled(
                 format!("{:+.4} USDC", s.net_pnl()),
                 Style::default()
-                    .fg(if s.net_pnl() >= 0.0 { Color::Green } else { Color::Red })
+                    .fg(if s.net_pnl() >= 0.0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  (全周期 cash+inv-fee+返, redeem 已计入)  追涨侧="),
             Span::styled(chase_str, Style::default().fg(Color::Yellow)),
         ]),
         Line::from({
-            let up_str = s.maker_buy_intent_up.map(|(p, q, _)| format!("UP @ {:.2}×{:.0}", p, q)).unwrap_or_else(|| "—".to_string());
-            let down_str = s.maker_buy_intent_down.map(|(p, q, _)| format!("DOWN @ {:.2}×{:.0}", p, q)).unwrap_or_else(|| "—".to_string());
+            let up_str = s
+                .ledger
+                .maker_buy_intent_up
+                .as_ref()
+                .map(|o| {
+                    format!(
+                        "UP @ {:.2}×{:.0}/{}",
+                        o.price,
+                        o.remaining_qty(),
+                        pending_reason_label(o.reason)
+                    )
+                })
+                .unwrap_or_else(|| "—".to_string());
+            let down_str = s
+                .ledger
+                .maker_buy_intent_down
+                .as_ref()
+                .map(|o| {
+                    format!(
+                        "DOWN @ {:.2}×{:.0}/{}",
+                        o.price,
+                        o.remaining_qty(),
+                        pending_reason_label(o.reason)
+                    )
+                })
+                .unwrap_or_else(|| "—".to_string());
             vec![
                 Span::raw("  挂单 "),
                 Span::styled("Maker买", Style::default().fg(Color::Cyan)),
@@ -756,8 +1069,16 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
             ]
         }),
         Line::from({
-            let up_hint = s.rebalance_hint_up.map(|(qty, avg)| format!("UP需{:.0}张 若成交均价和={:.2}", qty, avg)).unwrap_or_else(|| "—".to_string());
-            let down_hint = s.rebalance_hint_down.map(|(qty, avg)| format!("DOWN需{:.0}张 若成交均价和={:.2}", qty, avg)).unwrap_or_else(|| "—".to_string());
+            let up_hint = s
+                .ledger
+                .rebalance_hint_up
+                .map(|(qty, avg)| format!("UP需{:.0}张 若成交均价和={:.2}", qty, avg))
+                .unwrap_or_else(|| "—".to_string());
+            let down_hint = s
+                .ledger
+                .rebalance_hint_down
+                .map(|(qty, avg)| format!("DOWN需{:.0}张 若成交均价和={:.2}", qty, avg))
+                .unwrap_or_else(|| "—".to_string());
             vec![
                 Span::raw("  配平 "),
                 Span::styled(up_hint, Style::default().fg(Color::DarkGray)),

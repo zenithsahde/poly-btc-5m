@@ -1,4 +1,3 @@
-use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 /// execution/order_manager.rs - 挂单管理器
 /// 本地维护 Polymarket 所有活动挂单 (Active Orders)，支持快速检索以实现闪电撤单

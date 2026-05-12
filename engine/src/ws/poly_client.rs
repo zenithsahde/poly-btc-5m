@@ -1,24 +1,27 @@
+use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 /// ws/poly_client.rs - Polymarket CLOB WebSocket 客户端
 /// 新端点: wss://ws-subscriptions-clob.polymarket.com/ws/market
 /// 订阅: { "assets_ids": [token_id], "type": "market", "custom_feature_enabled": true }
 /// 支持: 完整订单簿、自动在 5m 窗口结束时切换到下一市场、PING 保活
-
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{info, warn, error};
-use serde::Serialize;
+use tracing::{error, info, warn};
 
 use crate::tui::app::{AppState, BookLevel};
-use crate::ws::discovery::{MarketDiscovery, Active5mMarket};
+use crate::ws::discovery::{Active5mMarket, MarketDiscovery};
+use crate::ws::reconnect::ReconnectPolicy;
 use crate::ws::stream::{MarketEvent, PolyBookData};
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const PING_INTERVAL_SECS: u64 = 10;
 const SWITCH_CHECK_INTERVAL_SECS: u64 = 10;
+/// 重连退避：base 500ms，max 30s。switch_market_reconnect 不计入退避（视为正常切换）
+const RECONNECT_BASE_MS: u64 = 500;
+const RECONNECT_MAX_MS: u64 = 30_000;
 
 #[derive(Debug, Serialize)]
 struct PolySubscribeMsg {
@@ -75,13 +78,20 @@ impl PolyWsClient {
     }
 
     pub async fn run(self) -> Result<()> {
+        let mut reconnect = ReconnectPolicy::new(RECONNECT_BASE_MS, RECONNECT_MAX_MS);
         loop {
-            match self.connect_and_recv().await {
-                Ok(_) => warn!("Poly WS 连接正常关闭，重连中..."),
+            let was_market_switch;
+            match self.connect_and_recv(&mut reconnect).await {
+                Ok(_) => {
+                    was_market_switch = false;
+                    warn!("Poly WS 连接正常关闭，重连中...");
+                }
                 Err(e) => {
                     if e.to_string().contains("switch_market_reconnect") {
+                        was_market_switch = true;
                         info!("Poly 切换市场后重连中...");
                     } else {
+                        was_market_switch = false;
                         error!("Poly WS 错误: {:?}", e);
                     }
                 }
@@ -89,15 +99,36 @@ impl PolyWsClient {
             if let Ok(mut s) = self.state.write() {
                 s.poly_ws_connected = false;
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            // 切窗口的"重连"是正常流程，不计入退避；真正的故障才指数退避
+            let delay = if was_market_switch {
+                tokio::time::Duration::from_millis(RECONNECT_BASE_MS)
+            } else {
+                reconnect.next_delay()
+            };
+            if !was_market_switch {
+                warn!(
+                    "第 {} 次重连，等待 {}ms...",
+                    reconnect.attempt(),
+                    delay.as_millis()
+                );
+            }
+            tokio::time::sleep(delay).await;
         }
     }
 
-    async fn connect_and_recv(&self) -> Result<()> {
+    async fn connect_and_recv(&self, reconnect: &mut ReconnectPolicy) -> Result<()> {
         let (mut ws_stream, _) = connect_async(WS_URL).await.context("Poly WS 连接失败")?;
         info!("✅ Polymarket CLOB 已连接 (Market Channel)");
+        // 连接成功立即重置退避计数
+        reconnect.reset();
         if let Ok(mut s) = self.state.write() {
             s.poly_ws_connected = true;
+            // 重连成功 → 清空旧订单簿，避免基于断线期间的陈旧 best 价决策
+            //   订阅 book 事件后服务端会推完整快照覆盖
+            s.poly_bids.clear();
+            s.poly_asks.clear();
+            s.poly_down_bids.clear();
+            s.poly_down_asks.clear();
         }
 
         let ids: Vec<String> = {
@@ -120,11 +151,8 @@ impl PolyWsClient {
         let mut last_switch_check = tokio::time::Instant::now();
 
         loop {
-            let msg_result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                ws_stream.next(),
-            )
-            .await;
+            let msg_result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), ws_stream.next()).await;
 
             match msg_result {
                 Ok(Some(Ok(msg))) => {
@@ -146,8 +174,9 @@ impl PolyWsClient {
                             if text == "PONG" {
                                 continue;
                             }
-                            if let Err(e) =
-                                self.handle_ws_message(&text, recv_ts_ns, &mut ws_stream).await
+                            if let Err(e) = self
+                                .handle_ws_message(&text, recv_ts_ns, &mut ws_stream)
+                                .await
                             {
                                 warn!("Poly 消息处理: {:?}", e);
                             }
@@ -278,7 +307,10 @@ impl PolyWsClient {
             s.poly_window_end_ts = new_market.window_end_ts;
             s.strike_price = match strike_from_binance {
                 Ok(open) => {
-                    info!("K 取自币安窗口开始秒内首笔成交: {:.2} (ts={})", open, window_start_ts);
+                    info!(
+                        "K 取自币安窗口开始秒内首笔成交: {:.2} (ts={})",
+                        open, window_start_ts
+                    );
                     open.round()
                 }
                 Err(e) => {
@@ -297,7 +329,10 @@ impl PolyWsClient {
             s.poly_down_best_ask = 0.0;
             s.poly_down_last_trade_price = 0.0;
         }
-        info!("✅ 已切换到: {} 窗口结束: {}（将重连以获取新订单簿）", new_market.slug, new_market.window_end_ts);
+        info!(
+            "✅ 已切换到: {} 窗口结束: {}（将重连以获取新订单簿）",
+            new_market.slug, new_market.window_end_ts
+        );
 
         self.prefetch_next_market().await;
         // 主动重连：新连接只订阅当前市场，服务端会推送完整 book 快照
@@ -323,7 +358,14 @@ impl PolyWsClient {
                     Ok(single) => vec![single],
                     Err(_) => {
                         // 服务端可能推送非 JSON（如订阅确认、空行等），忽略即可
-                        tracing::debug!("Poly 忽略非 JSON 消息: {:?}", if text.len() > 80 { format!("{}...", &text[..80]) } else { text.to_string() });
+                        tracing::debug!(
+                            "Poly 忽略非 JSON 消息: {:?}",
+                            if text.len() > 80 {
+                                format!("{}...", &text[..80])
+                            } else {
+                                text.to_string()
+                            }
+                        );
                         return Ok(());
                     }
                 }
@@ -384,12 +426,23 @@ impl PolyWsClient {
                         });
                         self.apply_full_book_to_state(&data, up);
                     } else {
-                        warn!("Poly book 解析失败 | raw event_type={} asset_id={}", et, asset_id);
+                        warn!(
+                            "Poly book 解析失败 | raw event_type={} asset_id={}",
+                            et, asset_id
+                        );
                     }
                 }
                 "best_bid_ask" => {
-                    let best_bid = m.get("best_bid").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                    let best_ask = m.get("best_ask").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    let best_bid = m
+                        .get("best_bid")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let best_ask = m
+                        .get("best_ask")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
                     if let Ok(mut s) = self.state.write() {
                         if is_up {
                             s.poly_best_bid = best_bid;
@@ -406,8 +459,16 @@ impl PolyWsClient {
                         for pc in arr {
                             let pid = pc.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
                             let up = pid == up_id;
-                            let best_bid = pc.get("best_bid").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                            let best_ask = pc.get("best_ask").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                            let best_bid = pc
+                                .get("best_bid")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let best_ask = pc
+                                .get("best_ask")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
                             if (best_bid > 0.0 || best_ask > 0.0) && (up || pid == down_id) {
                                 if let Ok(mut s) = self.state.write() {
                                     if up {
@@ -424,8 +485,16 @@ impl PolyWsClient {
                     }
                 }
                 "last_trade_price" => {
-                    let price = m.get("price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                    let side = m.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let price = m
+                        .get("price")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let side = m
+                        .get("side")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if let Ok(mut s) = self.state.write() {
                         if is_up {
                             s.poly_last_trade_price = price;
@@ -460,7 +529,11 @@ impl PolyWsClient {
                 Some(BookLevel { price, qty })
             })
             .collect();
-        bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        bids.sort_by(|a, b| {
+            b.price
+                .partial_cmp(&a.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         bids.truncate(15);
         let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);
 
@@ -474,7 +547,11 @@ impl PolyWsClient {
                 Some(BookLevel { price, qty })
             })
             .collect();
-        asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        asks.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         asks.truncate(15);
         let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
         let last_trade = data

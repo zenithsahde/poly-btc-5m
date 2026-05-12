@@ -1,7 +1,7 @@
+use crate::model::{orderbook::DepthData, ticker::BookTickerData, trade::AggTradeData};
 /// ws/stream.rs - 市场数据流事件类型
 /// 统一描述来自所有订阅流的消息
 use serde::Deserialize;
-use crate::model::{orderbook::DepthData, ticker::BookTickerData, trade::AggTradeData};
 
 /// 解析后的市场数据流事件
 #[derive(Debug, Clone)]

@@ -1,11 +1,11 @@
 /// tui/app.rs - TUI 共享应用状态
 /// 由策略引擎写入，由 UI 渲染器读取（Arc<RwLock<AppState>>）
 use std::collections::VecDeque;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io;
 use std::time::Instant;
 
-use chrono::TimeZone;
+use crate::position::PositionLedger;
+pub use crate::position::PositionSide as ChaseSide;
 
 /// 面板展示用的单条成交记录
 #[derive(Clone, Debug)]
@@ -55,64 +55,6 @@ pub struct DelayStats {
     pub sum_neg_ms: f64,
     pub min_neg_ms: f64,
     pub max_neg_ms: f64,
-}
-
-/// 当前可追涨的一侧（UP/DOWN 不会同时涨）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChaseSide {
-    Up,
-    Down,
-}
-
-/// 单笔成交记录（用于落盘与统计）；成交瞬间的盘口为快照，不事后计算
-#[derive(Clone, Debug)]
-pub struct TradeRecord {
-    pub side: ChaseSide,
-    pub buy_sell: bool,   // true=buy, false=sell
-    pub maker_taker: bool, // true=maker, false=taker
-    pub price: f64,
-    pub qty: f64,
-    pub ts_ms: i64,
-    pub window_end_ts: i64,
-    /// 成交瞬间 UP 侧 best_ask 快照
-    pub up_ask: f64,
-    /// 成交瞬间 UP 侧 best_bid 快照
-    pub up_bid: f64,
-    /// 成交瞬间 UP 侧点差 (ask-bid) 快照
-    pub up_spread: f64,
-    /// 成交瞬间 DOWN 侧 best_ask 快照
-    pub down_ask: f64,
-    /// 成交瞬间 DOWN 侧 best_bid 快照
-    pub down_bid: f64,
-    /// 成交瞬间 DOWN 侧点差 (ask-bid) 快照
-    pub down_spread: f64,
-}
-
-/// 单侧仓位（数量 + 持仓均价）
-#[derive(Clone, Debug, Default)]
-pub struct Position {
-    pub qty: f64,
-    pub avg_price: f64,
-}
-
-impl Position {
-    pub fn cost(&self) -> f64 {
-        self.qty * self.avg_price
-    }
-    /// 浮盈/浮亏金额（多仓：(now - avg)*qty）
-    pub fn float_pnl(&self, price_now: f64) -> f64 {
-        (price_now - self.avg_price) * self.qty
-    }
-    /// 浮亏% = (avg - now)/avg（仅当 avg > 0 且亏损时有意义）
-    pub fn float_loss_pct(&self, price_now: f64) -> Option<f64> {
-        if self.avg_price <= 0.0 || self.qty <= 0.0 {
-            return None;
-        }
-        if price_now >= self.avg_price {
-            return Some(0.0);
-        }
-        Some((self.avg_price - price_now) / self.avg_price)
-    }
 }
 
 impl DelayStats {
@@ -242,37 +184,9 @@ pub struct AppState {
     /// 近期 Poly 明显变动 (发现变动的时刻, poly_mid)，用于负延迟匹配，保留约 5s
     pub recent_poly_moves: VecDeque<(Instant, f64)>,
     /// --- 做市/仓位与成交 ---
-    pub position_up: Position,
-    pub position_down: Position,
-    /// 本窗口内成交记录（市场切换时落盘）
-    pub trades_current_window: Vec<TradeRecord>,
-    /// 已发生 taker 手续费累计（公式：qty × 0.072 × p × (1−p)）
-    pub total_fee: f64,
-    /// Maker rebate 累计（25% 的 taker fee 返还给做市商）
-    pub total_rebate: f64,
-    /// 已实现盈亏累计（每次卖出时累加 (卖出价 − 持仓均价)×数量）
-    pub realized_pnl: f64,
+    pub ledger: PositionLedger,
     /// 当前可追涨侧（用于展示与浮亏减仓；UP 优先，若 UP 满足则显 UP）
     pub chase_side: Option<ChaseSide>,
-    /// Maker 买意图：UP 侧 (挂单价, 数量, placed_ts_ms)：追涨 5 张，配平为计算出的配平量
-    pub maker_buy_intent_up: Option<(f64, f64, i64)>,
-    /// Maker 买意图：DOWN 侧 (挂单价, 数量, placed_ts_ms)
-    pub maker_buy_intent_down: Option<(f64, f64, i64)>,
-    /// === v0.4.0-5m: Merge-based 经济模型字段 ===
-    /// 累计已虚拟 merge 的对数（每对兑换 1.00 USDC）
-    pub merged_pairs: f64,
-    /// Merge 实现盈亏 = Σ pair_qty × (1.00 - (avg_up + avg_down))
-    pub merge_pnl: f64,
-    /// Merge 收到的现金（USDC）= merged_pairs × 1.00
-    pub cash_received: f64,
-    /// Buy 累计花出去的现金（USDC）= Σ buy_price × buy_qty
-    pub cash_paid: f64,
-    /// 上次 merge 时间戳（ms），用于节流
-    pub last_merge_ts_ms: i64,
-    /// 配平提示 UP：(配平需多少张, 若全配平价后均价之和)
-    pub rebalance_hint_up: Option<(f64, f64)>,
-    /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
-    pub rebalance_hint_down: Option<(f64, f64)>,
 }
 
 impl AppState {
@@ -330,28 +244,15 @@ impl AppState {
             delay_stats: DelayStats::default(),
             last_poly_mid: 0.0,
             recent_poly_moves: VecDeque::with_capacity(200), // ~5s at 40/s
-            position_up: Position::default(),
-            position_down: Position::default(),
-            trades_current_window: Vec::new(),
-            total_fee: 0.0,
-            total_rebate: 0.0,
-            realized_pnl: 0.0,
+            ledger: PositionLedger::default(),
             chase_side: None,
-            maker_buy_intent_up: None,
-            maker_buy_intent_down: None,
-            merged_pairs: 0.0,
-            merge_pnl: 0.0,
-            cash_received: 0.0,
-            cash_paid: 0.0,
-            last_merge_ts_ms: 0,
-            rebalance_hint_up: None,
-            rebalance_hint_down: None,
         }
     }
 
     /// Poly 数据延迟（毫秒），无数据时返回 None
     pub fn poly_delay_ms(&self) -> Option<u64> {
-        self.poly_last_update.map(|t| t.elapsed().as_millis() as u64)
+        self.poly_last_update
+            .map(|t| t.elapsed().as_millis() as u64)
     }
 
     /// 添加成交记录（最多保留 20 条）
@@ -391,136 +292,65 @@ impl AppState {
     }
     /// UP/DOWN 持仓均价之和（应 < 1）
     pub fn position_avg_sum(&self) -> f64 {
-        self.position_up.avg_price + self.position_down.avg_price
+        self.ledger.position_avg_sum()
     }
 
     /// 若当前 Maker 买挂单均成交，UP 侧预估持仓量（用意图中的数量）
     pub fn projected_qty_up_after_intents(&self) -> f64 {
-        self.position_up.qty
-            + self.maker_buy_intent_up.map(|(_, q, _)| q).unwrap_or(0.0)
+        self.ledger.projected_qty_up_after_intents()
     }
 
     /// 若当前 Maker 买挂单均成交，DOWN 侧预估持仓量
     pub fn projected_qty_down_after_intents(&self) -> f64 {
-        self.position_down.qty
-            + self.maker_buy_intent_down.map(|(_, q, _)| q).unwrap_or(0.0)
+        self.ledger.projected_qty_down_after_intents()
     }
 
     /// 若当前 Maker 买挂单均成交，预估的仓位均价之和（用于配平与约束判断）
     pub fn projected_avg_sum_after_intents(&self) -> f64 {
-        let (avg_up, avg_down) = (
-            self.position_up.avg_price,
-            self.position_down.avg_price,
-        );
-        let (qty_up, qty_down) = (self.position_up.qty, self.position_down.qty);
-        let proj_avg_up = match self.maker_buy_intent_up {
-            Some((p, q, _)) => {
-                let new_qty = qty_up + q;
-                if new_qty > 0.0 {
-                    (qty_up * avg_up + p * q) / new_qty
-                } else {
-                    p
-                }
-            }
-            None => avg_up,
-        };
-        let proj_avg_down = match self.maker_buy_intent_down {
-            Some((p, q, _)) => {
-                let new_qty = qty_down + q;
-                if new_qty > 0.0 {
-                    (qty_down * avg_down + p * q) / new_qty
-                } else {
-                    p
-                }
-            }
-            None => avg_down,
-        };
-        proj_avg_up + proj_avg_down
+        self.ledger.projected_avg_sum_after_intents()
     }
 
     /// 若在该侧再成交一笔买（price × qty），成交后的均价之和（用于配平条件：全配平价后须 < 1）
     pub fn avg_sum_if_buy_filled(&self, side: ChaseSide, price: f64, qty: f64) -> f64 {
-        if qty <= 0.0 {
-            return self.position_avg_sum();
-        }
-        let (new_avg_up, new_avg_down) = match side {
-            ChaseSide::Up => {
-                let q = self.position_up.qty;
-                let a = self.position_up.avg_price;
-                let new_q = q + qty;
-                let new_avg_up = if new_q > 0.0 {
-                    (q * a + price * qty) / new_q
-                } else {
-                    price
-                };
-                (new_avg_up, self.position_down.avg_price)
-            }
-            ChaseSide::Down => {
-                let q = self.position_down.qty;
-                let a = self.position_down.avg_price;
-                let new_q = q + qty;
-                let new_avg_down = if new_q > 0.0 {
-                    (q * a + price * qty) / new_q
-                } else {
-                    price
-                };
-                (self.position_up.avg_price, new_avg_down)
-            }
-        };
-        new_avg_up + new_avg_down
+        self.ledger.avg_sum_if_buy_filled(side, price, qty)
     }
 
     /// 总浮盈/浮亏（金额，未扣手续费）
     pub fn total_float_pnl(&self) -> f64 {
-        let up = self.position_up.float_pnl(self.poly_up_mid());
-        let down = self.position_down.float_pnl(self.poly_down_mid());
-        up + down
+        self.ledger
+            .total_float_pnl(self.poly_up_mid(), self.poly_down_mid())
     }
     /// (legacy 兼容名) 总盈亏 — v0.4.0-5m 改为 cash_pnl + inventory_value − cash_paid + rebate − fee
     /// 数学等价：(cash_received + inventory_value − cash_paid) − fee + rebate
     pub fn total_pnl_after_fee(&self) -> f64 {
-        self.cash_pnl() + self.inventory_value() - self.total_fee
+        self.cash_pnl() + self.inventory_value() - self.ledger.total_fee
     }
     /// 净盈亏（v0.4.0-5m 重新框定）
     /// = cash_received(merge) + inventory_value(库存按市价) − cash_paid(buy) − taker_fee + maker_rebate
     pub fn net_pnl(&self) -> f64 {
-        self.cash_pnl() + self.inventory_value() - self.total_fee + self.total_rebate
+        self.ledger.net_pnl(self.inventory_value())
     }
     /// 当前可虚拟 merge 的对数 = min(qty_up, qty_down)
     pub fn mergeable_pairs(&self) -> f64 {
-        self.position_up.qty.min(self.position_down.qty)
+        self.ledger.mergeable_pairs()
     }
 
     /// 现金账面 P&L = merge 收到的 USDC − buy 花出去的 USDC
     pub fn cash_pnl(&self) -> f64 {
-        self.cash_received - self.cash_paid
+        self.ledger.cash_pnl()
     }
 
     /// 库存按市价估值 = qty_up × poly_up_mid + qty_down × poly_down_mid
     /// 其中已可 merge 部分按 1.00 / pair 估值（= mergeable_pairs × 1.00）；超出部分按 mid
     pub fn inventory_value(&self) -> f64 {
-        let pairs = self.mergeable_pairs();
-        let extra_up = (self.position_up.qty - pairs).max(0.0);
-        let extra_down = (self.position_down.qty - pairs).max(0.0);
-        pairs * 1.00 + extra_up * self.poly_up_mid() + extra_down * self.poly_down_mid()
+        self.ledger
+            .inventory_value(self.poly_up_mid(), self.poly_down_mid())
     }
 
     /// 应用一次虚拟 merge：扣减两侧 qty（avg 不变，因为按比例移除），增加 merge_pnl
     /// 经济意义：每对净利 = 1.00 − (avg_up + avg_down)
     pub fn apply_merge(&mut self, pair_qty: f64, ts_ms: i64) {
-        let pq = pair_qty.min(self.mergeable_pairs()).max(0.0);
-        if pq <= 0.0 { return; }
-        let avg_sum = self.position_up.avg_price + self.position_down.avg_price;
-        // pair_qty × (1.00 - avg_sum)：avg_sum < 1 时盈利，> 1 时亏损
-        let delta_pnl = pq * (1.00 - avg_sum);
-        self.merge_pnl += delta_pnl;
-        self.cash_received += pq * 1.00;
-        self.merged_pairs += pq;
-        self.position_up.qty = (self.position_up.qty - pq).max(0.0);
-        self.position_down.qty = (self.position_down.qty - pq).max(0.0);
-        if self.position_up.qty <= 0.0 { self.position_up.avg_price = 0.0; }
-        if self.position_down.qty <= 0.0 { self.position_down.avg_price = 0.0; }
-        self.last_merge_ts_ms = ts_ms;
+        self.ledger.apply_merge(pair_qty, ts_ms);
     }
 
     /// 应用一笔 maker buy 成交（v0.4.0-5m：只 buy，sell 全删）。
@@ -541,112 +371,32 @@ impl AppState {
         down_bid: f64,
         down_ask: f64,
     ) {
-        debug_assert!(buy_sell, "v0.4.0-5m: apply_fill 只支持 buy；sell 由 apply_merge 处理");
-        if !buy_sell { return; } // 防御性：永不执行 sell 分支
-
-        let p_clamped = price.clamp(0.0, 1.0);
-        let taker_fee = qty * 0.072 * p_clamped * (1.0 - p_clamped);
-        if maker_taker {
-            self.total_rebate += taker_fee * 0.25;
-        } else {
-            self.total_fee += taker_fee;
-        }
-        // Buy 流出现金
-        self.cash_paid += price * qty;
-        let pos = match side {
-            ChaseSide::Up => &mut self.position_up,
-            ChaseSide::Down => &mut self.position_down,
-        };
-        let total_qty = pos.qty + qty;
-        if total_qty > 0.0 {
-            pos.avg_price = (pos.avg_price * pos.qty + price * qty) / total_qty;
-        }
-        pos.qty = total_qty;
-
-        let up_spread = (up_ask - up_bid).max(0.0);
-        let down_spread = (down_ask - down_bid).max(0.0);
-        self.trades_current_window.push(TradeRecord {
+        self.ledger.apply_fill(
             side,
             buy_sell,
             maker_taker,
             price,
             qty,
             ts_ms,
-            window_end_ts: self.poly_window_end_ts,
-            up_ask,
+            self.poly_window_end_ts,
             up_bid,
-            up_spread,
-            down_ask,
+            up_ask,
             down_bid,
-            down_spread,
-        });
+            down_ask,
+        );
     }
 
     /// 市场切换时：将本窗口成交记录写入文件（每笔含 side/方向/maker_taker/price/qty/ts_ms），再清空内存；只保留最新 10 份文件
     pub fn save_trades_for_window_and_clear(&mut self, window_end_ts: i64) -> io::Result<()> {
-        let dir = Path::new("trades");
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("trades_{}.csv", window_end_ts));
-        if !self.trades_current_window.is_empty() {
-            let mut f = std::fs::File::create(&path)?;
-            writeln!(f, "side,direction,maker_taker,price,qty,ts_ms,ts_iso,window_end_ts,up_ask,up_bid,up_spread,down_ask,down_bid,down_spread")?;
-            for r in &self.trades_current_window {
-                let side = match r.side {
-                    ChaseSide::Up => "UP",
-                    ChaseSide::Down => "DOWN",
-                };
-                let direction = if r.buy_sell { "buy" } else { "sell" };
-                let mt = if r.maker_taker { "maker" } else { "taker" };
-                let ts_iso = chrono::Utc
-                    .timestamp_millis_opt(r.ts_ms)
-                    .single()
-                    .map(|t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-                    .unwrap_or_else(|| "".to_string());
-                writeln!(
-                    f,
-                    "{},{},{},{:.6},{:.6},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                    side, direction, mt, r.price, r.qty, r.ts_ms, ts_iso, r.window_end_ts,
-                    r.up_ask, r.up_bid, r.up_spread, r.down_ask, r.down_bid, r.down_spread
-                )?;
-            }
-            f.flush()?;
-        }
-        self.trades_current_window.clear();
-        Self::prune_trades_dir_keep_latest(dir, 10)?;
-        Ok(())
-    }
-
-    /// 只保留 trades 目录下最新 keep 份 trades_*.csv（按 window_end_ts 即文件名中数字降序），删除更早的
-    fn prune_trades_dir_keep_latest(dir: &Path, keep: usize) -> io::Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension().map_or(false, |ext| ext == "csv")
-                    && e.file_name().to_string_lossy().starts_with("trades_")
-            })
-            .collect();
-        entries.sort_by(|a, b| {
-            let ts_a = a.path().file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("trades_")).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            let ts_b = b.path().file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix("trades_")).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            ts_b.cmp(&ts_a)
-        });
-        for e in entries.into_iter().skip(keep) {
-            let _ = std::fs::remove_file(e.path());
-        }
-        Ok(())
+        self.ledger.save_trades_for_window_and_clear(window_end_ts)
     }
 
     /// 市场切换后：清零本窗口仓位与挂单意图，新 5 分钟窗口从零库存开始
     /// v0.4.3-5m：所有 P&L 字段统一为跨窗口累积（fee / rebate / cash_* / merge_pnl 全保留）
     /// 仅清零物理上不能延续的字段（仓位/挂单/提示）—— 因为新窗口是新 token IDs，旧 qty 物理上失效
     pub fn reset_inventory_for_new_window(&mut self) {
-        self.position_up = Position::default();
-        self.position_down = Position::default();
-        self.maker_buy_intent_up = None;
-        self.maker_buy_intent_down = None;
+        self.ledger.reset_for_new_window();
         self.chase_side = None;
-        self.rebalance_hint_up = None;
-        self.rebalance_hint_down = None;
         // v0.4.3-5m: total_fee / total_rebate / realized_pnl 不再 reset（跨窗口累积）
         // merged_pairs / merge_pnl / cash_received / cash_paid 仍跨窗口累积
     }
@@ -657,31 +407,8 @@ impl AppState {
     ///   3. 输家边残仓直接清零（链上现实：作废）
     /// 调用时机：窗口切换前一刻（poly_client.rs:switch_to_next_market）
     pub fn settle_window_and_redeem(&mut self, binance_close: f64, ts_ms: i64) {
-        // (1) Force-merge 所有可配对（即使 avg_sum > 1 也 merge，因为 redeem 数学等价）
-        let pairs = self.mergeable_pairs();
-        if pairs > 0.0 {
-            let avg_sum = self.position_up.avg_price + self.position_down.avg_price;
-            self.merge_pnl += pairs * (1.0 - avg_sum);
-            self.cash_received += pairs * 1.0;
-            self.merged_pairs += pairs;
-            self.position_up.qty -= pairs;
-            self.position_down.qty -= pairs;
-            self.last_merge_ts_ms = ts_ms;
-            if self.position_up.qty <= 0.0 { self.position_up.avg_price = 0.0; }
-            if self.position_down.qty <= 0.0 { self.position_down.avg_price = 0.0; }
-        }
-        // (2) 残单边 redeem：按 BTC 是否高于 K 判定赢家
-        if self.strike_price > 0.0 && binance_close > 0.0 {
-            let up_wins = binance_close >= self.strike_price;
-            if up_wins && self.position_up.qty > 0.0 {
-                // UP 赢：每张 $1.00（注意：cash_paid 已记入 buy 时的成本，所以净 = 1.00 - avg）
-                self.cash_received += self.position_up.qty * 1.0;
-            } else if !up_wins && self.position_down.qty > 0.0 {
-                // DOWN 赢：每张 $1.00
-                self.cash_received += self.position_down.qty * 1.0;
-            }
-            // 输家边什么都不做（链上 = 作废 = $0），下面 reset 会清 qty
-        }
+        self.ledger
+            .settle_window_and_redeem(self.strike_price, binance_close, ts_ms);
     }
 
     /// Poly BTC 推算价格 = 币安 mid_price + poly_btc_offset

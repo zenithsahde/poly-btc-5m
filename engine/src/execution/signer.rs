@@ -1,13 +1,12 @@
 /// execution/signer.rs - Polymarket EIP-712 签名模块
 /// 基于 alloy-rs 实现高性能订单授权
-
-use alloy_primitives::{address, Address, U256};
-use alloy_sol_types::{sol, SolStruct};
-use alloy_signer::{Signer as AlloySigner};
+use alloy_primitives::{address, Address};
+use alloy_signer::Signer as AlloySigner;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{sol, SolStruct};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use serde::{Serialize, Deserialize};
 
 sol! {
     /// Polymarket CLOB 订单结构体 (EIP-712)
@@ -42,9 +41,8 @@ pub struct PolySigner {
 impl PolySigner {
     /// 初始化签名器
     pub fn new(priv_key: &str) -> Result<Self> {
-        let signer = PrivateKeySigner::from_str(priv_key)
-            .context("无效的私钥格式")?;
-        
+        let signer = PrivateKeySigner::from_str(priv_key).context("无效的私钥格式")?;
+
         // 定义 Polymarket CTF Exchange Domain
         let domain = alloy_sol_types::eip712_domain! {
             name: "Polymarket CTF Exchange",
@@ -60,10 +58,10 @@ impl PolySigner {
     pub async fn sign_order(&self, order: &Order) -> Result<Vec<u8>> {
         // 计算结构化哈希
         let hash = order.eip712_signing_hash(&self.domain);
-        
+
         // 执行签名
         let sig = self.signer.sign_hash(&hash).await?;
-        
+
         // 转换为 [r, s, v] 格式字节数组
         Ok(sig.as_bytes().to_vec())
     }

@@ -32,11 +32,21 @@ pub struct TradingConfig {
     pub volatility_sigma_max_poly: f64,
 }
 
-fn default_strike_price() -> f64 { 96000.0 }
-fn default_volatility_annual() -> f64 { 0.6 }
-fn default_sigma_min() -> f64 { 0.1 }
-fn default_sigma_max() -> f64 { 2.0 }
-fn default_sigma_max_poly() -> f64 { 5.0 }
+fn default_strike_price() -> f64 {
+    96000.0
+}
+fn default_volatility_annual() -> f64 {
+    0.6
+}
+fn default_sigma_min() -> f64 {
+    0.1
+}
+fn default_sigma_max() -> f64 {
+    2.0
+}
+fn default_sigma_max_poly() -> f64 {
+    5.0
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WebSocketConfig {

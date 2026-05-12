@@ -1,8 +1,7 @@
 /// execution/poly_api.rs - Polymarket CLOB 订单提交模块
 /// 负责将签名后的 Order 对象发送至后端 REST API
-
 use crate::execution::signer::Order;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use reqwest::Client;
 use serde_json::json;
 use tracing::info;
@@ -22,14 +21,10 @@ impl PolyApiSubmitter {
     }
 
     /// 提交订单至 Polymarket
-    pub async fn submit_order(
-        &self,
-        order: Order,
-        signature: Vec<u8>,
-    ) -> Result<String> {
+    pub async fn submit_order(&self, order: Order, signature: Vec<u8>) -> Result<String> {
         let url = format!("{}/order", self.base_url);
         let sig_hex = format!("0x{}", hex::encode(signature));
-        
+
         let payload = json!({
             "order": {
                 "salt": order.salt.to_string(),
@@ -61,7 +56,7 @@ impl PolyApiSubmitter {
     ) -> Result<String> {
         let url = format!("{}/order", self.base_url);
         let sig_hex = format!("0x{}", hex::encode(signature));
-        
+
         let payload = json!({
             "order": {
                 "orderHash": format!("{:?}", cancel.orderHash),

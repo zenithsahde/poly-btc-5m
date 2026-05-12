@@ -67,7 +67,10 @@ impl Snap30msWriter {
                 self.rotate();
             } else {
                 // 启动后的第一个窗口（残缺）→ 丢弃
-                tracing::info!("snap30ms: discarded incomplete window {}", self.current_window_end_ts);
+                tracing::info!(
+                    "snap30ms: discarded incomplete window {}",
+                    self.current_window_end_ts
+                );
             }
             self.buffer.clear();
             self.is_first_window = false;
@@ -158,7 +161,11 @@ pub async fn run_snapshot_task(state: Arc<RwLock<AppState>>) {
     let mut tick = interval(Duration::from_millis(TICK_MS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    tracing::info!("snap30ms: started, interval={}ms, dir={}", TICK_MS, SNAPSHOT_DIR);
+    tracing::info!(
+        "snap30ms: started, interval={}ms, dir={}",
+        TICK_MS,
+        SNAPSHOT_DIR
+    );
 
     loop {
         tick.tick().await;
@@ -179,7 +186,11 @@ pub async fn run_snapshot_task(state: Arc<RwLock<AppState>>) {
                 sigma: s.volatility_annual,
                 strike: s.strike_price,
                 expiry_min: s.expiry_minutes,
-                market_state: if s.market_state == "稳态" { b'S' } else { b'E' },
+                market_state: if s.market_state == "稳态" {
+                    b'S'
+                } else {
+                    b'E'
+                },
                 window_end_ts: s.poly_window_end_ts,
             }
         } else {

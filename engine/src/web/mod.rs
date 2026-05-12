@@ -50,6 +50,8 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("无法绑定 {}", addr))?;
-    axum::serve(listener, app).await.context("axum::serve 失败")?;
+    axum::serve(listener, app)
+        .await
+        .context("axum::serve 失败")?;
     Ok(())
 }

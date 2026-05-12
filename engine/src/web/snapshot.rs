@@ -10,6 +10,7 @@ use shared_types::{
     OrderbookView, PolyBook, PolyView, PositionSide, PositionView, TradeRow,
 };
 
+use crate::position::ManagedOrder;
 use crate::tui::app::{AppState, BookLevel, ChaseSide};
 
 const POLY_BOOK_DEPTH: usize = 15;
@@ -89,33 +90,33 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
     let down_mid = s.poly_down_mid();
     let position = PositionView {
         up: PositionSide {
-            qty: s.position_up.qty,
-            avg_price: s.position_up.avg_price,
-            float_pnl: s.position_up.float_pnl(up_mid),
+            qty: s.ledger.position_up.qty,
+            avg_price: s.ledger.position_up.avg_price,
+            float_pnl: s.ledger.position_up.float_pnl(up_mid),
         },
         down: PositionSide {
-            qty: s.position_down.qty,
-            avg_price: s.position_down.avg_price,
-            float_pnl: s.position_down.float_pnl(down_mid),
+            qty: s.ledger.position_down.qty,
+            avg_price: s.ledger.position_down.avg_price,
+            float_pnl: s.ledger.position_down.float_pnl(down_mid),
         },
         avg_sum: s.position_avg_sum(),
         mergeable_pairs: s.mergeable_pairs(),
-        merged_pairs: s.merged_pairs,
-        merge_pnl: s.merge_pnl,
-        realized_pnl: s.realized_pnl,
-        total_fee: s.total_fee,
-        total_rebate: s.total_rebate,
-        cash_received: s.cash_received,
-        cash_paid: s.cash_paid,
+        merged_pairs: s.ledger.merged_pairs,
+        merge_pnl: s.ledger.merge_pnl,
+        realized_pnl: s.ledger.realized_pnl,
+        total_fee: s.ledger.total_fee,
+        total_rebate: s.ledger.total_rebate,
+        cash_received: s.ledger.cash_received,
+        cash_paid: s.ledger.cash_paid,
         cash_pnl: s.cash_pnl(),
         inventory_value: s.inventory_value(),
         total_float_pnl: s.total_float_pnl(),
         net_pnl: s.net_pnl(),
         chase_side: s.chase_side.map(chase_side_str),
-        rebalance_hint_up: s.rebalance_hint_up,
-        rebalance_hint_down: s.rebalance_hint_down,
-        maker_buy_intent_up: s.maker_buy_intent_up,
-        maker_buy_intent_down: s.maker_buy_intent_down,
+        rebalance_hint_up: s.ledger.rebalance_hint_up,
+        rebalance_hint_down: s.ledger.rebalance_hint_down,
+        maker_buy_intent_up: managed_order_tuple(s.ledger.maker_buy_intent_up.as_ref()),
+        maker_buy_intent_down: managed_order_tuple(s.ledger.maker_buy_intent_down.as_ref()),
     };
 
     let fair_value = FairValueView {
@@ -162,14 +163,20 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
 
 fn levels_from(src: &[BookLevel]) -> Vec<Level> {
     src.iter()
-        .map(|l| Level { price: l.price, qty: l.qty })
+        .map(|l| Level {
+            price: l.price,
+            qty: l.qty,
+        })
         .collect()
 }
 
 fn levels_from_capped(src: &[BookLevel], cap: usize) -> Vec<Level> {
     src.iter()
         .take(cap)
-        .map(|l| Level { price: l.price, qty: l.qty })
+        .map(|l| Level {
+            price: l.price,
+            qty: l.qty,
+        })
         .collect()
 }
 
@@ -178,4 +185,8 @@ fn chase_side_str(s: ChaseSide) -> String {
         ChaseSide::Up => "UP".to_string(),
         ChaseSide::Down => "DOWN".to_string(),
     }
+}
+
+fn managed_order_tuple(order: Option<&ManagedOrder>) -> Option<(f64, f64, i64)> {
+    order.map(|o| (o.price, o.remaining_qty(), o.placed_ts_ms))
 }

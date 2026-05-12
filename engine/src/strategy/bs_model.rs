@@ -108,7 +108,9 @@ pub fn find_implied_volatility(
     // S < K：价格先升后降，p_lo≈0、p_hi≈0，需先找使价格最大的 σ
     let mut sigma_max = 0.5;
     let mut p_max = calculate_binary_call_price(spot, strike, expiry_years, sigma_max);
-    for &s in &[0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0] {
+    for &s in &[
+        0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+    ] {
         let p = calculate_binary_call_price(spot, strike, expiry_years, s);
         if p > p_max {
             p_max = p;
@@ -170,8 +172,18 @@ mod tests {
         for target in [0.02, 0.2, 0.5, 0.8, 0.98] {
             let iv = find_implied_volatility(spot, strike, t, target);
             let back = calculate_binary_call_price(spot, strike, t, iv);
-            let tol = if target < 0.05 || target > 0.95 { 2e-2 } else { 1e-4 };
-            assert!((back - target).abs() < tol, "target={} iv={} back={}", target, iv, back);
+            let tol = if target < 0.05 || target > 0.95 {
+                2e-2
+            } else {
+                1e-4
+            };
+            assert!(
+                (back - target).abs() < tol,
+                "target={} iv={} back={}",
+                target,
+                iv,
+                back
+            );
         }
     }
 
@@ -184,6 +196,12 @@ mod tests {
         let iv = find_implied_volatility(spot, strike, t, target);
         let back = calculate_binary_call_price(spot, strike, t, iv);
         assert!(iv > 0.01, "S<K 时 IV 不应触底, iv={}", iv);
-        assert!((back - target).abs() < 1e-3, "target={} iv={} back={}", target, iv, back);
+        assert!(
+            (back - target).abs() < 1e-3,
+            "target={} iv={} back={}",
+            target,
+            iv,
+            back
+        );
     }
 }

@@ -1,6 +1,5 @@
 /// ws/discovery.rs - Polymarket 市场自动发现
 /// 自动获取当前/下一 5m BTC 预测市场 Token ID，并返回窗口结束时间用于自动切换
-
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
@@ -55,7 +54,10 @@ impl MarketDiscovery {
             now_ts, expected_slug, window_end_ts
         );
 
-        let url = format!("https://gamma-api.polymarket.com/markets?slug={}", expected_slug);
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?slug={}",
+            expected_slug
+        );
         let response = client.get(&url).send().await?;
         let markets: Vec<GammaMarket> = response.json().await?;
 
@@ -88,7 +90,10 @@ impl MarketDiscovery {
             .build()?;
         let window_end_ts = window_start_ts + 300;
         let expected_slug = format!("btc-updown-5m-{}", window_start_ts);
-        let url = format!("https://gamma-api.polymarket.com/markets?slug={}", expected_slug);
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?slug={}",
+            expected_slug
+        );
         let response = client.get(&url).send().await?;
         let markets: Vec<GammaMarket> = response.json().await?;
         let target = markets

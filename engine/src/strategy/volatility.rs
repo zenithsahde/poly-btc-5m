@@ -26,7 +26,12 @@ impl RollingVolatility {
     /// 喂入最新成交价与交易所时间戳(ms)；会丢弃超过 BUFFER_MAX_MINUTES 的旧点
     pub fn update(&mut self, price: f64, ts_ms: u64) {
         let cutoff = ts_ms.saturating_sub(BUFFER_MAX_MINUTES * 60 * 1000);
-        while self.prices_ts.front().map(|&(_, t)| t < cutoff).unwrap_or(false) {
+        while self
+            .prices_ts
+            .front()
+            .map(|&(_, t)| t < cutoff)
+            .unwrap_or(false)
+        {
             self.prices_ts.pop_front();
         }
         if price > 0.0 {

@@ -1,7 +1,7 @@
-use crate::execution::signer::{PolySigner, Order, CancelOrder};
 use crate::execution::poly_api::PolyApiSubmitter;
+use crate::execution::signer::{CancelOrder, Order, PolySigner};
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 #[derive(Debug)]
 pub enum SnipeCommand {

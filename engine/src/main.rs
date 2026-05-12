@@ -27,8 +27,10 @@ use ratatui::prelude::CrosstermBackend;
 
 mod cli;
 mod config;
+mod execution;
 mod metrics;
 mod model;
+pub mod position;
 mod strategy;
 mod tui;
 mod web;
@@ -37,10 +39,10 @@ mod ws;
 use cli::{Cli, Mode};
 use config::AppConfig;
 use strategy::signal::SignalEngine;
+use tracing::{error, info};
 use tui::app::AppState;
 use ws::client::BinanceWsClient;
 use ws::poly_client::PolyWsClient;
-use tracing::{info, error};
 
 /// TUI 刷新率（毫秒）
 const TUI_REFRESH_MS: u64 = 50; // 20 FPS
@@ -59,7 +61,11 @@ async fn main() -> Result<()> {
     if std::env::var("RUST_LOG").is_ok() {
         let filter = tracing_subscriber::EnvFilter::from_default_env();
         if let Ok(path) = std::env::var("ENGINE_LOG_FILE") {
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 Ok(file) => {
                     tracing_subscriber::fmt()
                         .with_writer(std::sync::Mutex::new(file))
@@ -141,7 +147,11 @@ async fn main() -> Result<()> {
                 if let Ok(mut s) = state.write() {
                     s.strike_price = open.round();
                 }
-                info!("首屏 K 取自币安窗口开始秒内首笔成交: {:.0} (ts={})", open.round(), window_start);
+                info!(
+                    "首屏 K 取自币安窗口开始秒内首笔成交: {:.0} (ts={})",
+                    open.round(),
+                    window_start
+                );
             }
             Err(e) => tracing::warn!("首屏 K 拉取失败，使用配置: {:?}", e),
         }

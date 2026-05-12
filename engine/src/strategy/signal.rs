@@ -1,19 +1,21 @@
+use chrono::Local;
 /// strategy/signal.rs - 策略引擎
 /// 消费 MarketEvent，将数据写入 AppState 供 TUI 展示（无下单/撤单逻辑）
 /// 实现文档：Poly IV + 稳态/激变态 + 粘性波动率
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use chrono::Local;
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use crate::execution::ioc::execute_ioc_buy;
 use crate::{
     config::AppConfig,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
     strategy::{
-        bs_model,
+        decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
+        fv::{FvEngine, FvInputs},
         fv_snapshots::{FvRow, FvSnapshotWriter},
         volatility::RollingVolatility,
     },
@@ -41,12 +43,12 @@ const LEAD_TIMEOUT_MS: u64 = 10_000;
 /// 回测 472K 行实证：gap=0.07 fee=$102 PnL=+$308；gap=0.10 fee=$52 PnL=+$329。fee 减半，PnL +7%
 /// 底层逻辑：force-balance 在 BTC 单向走时强制配对追贵对侧，gap 越严越能过滤"假 lead"
 const CHASE_GAP_MIN: f64 = 0.10;
-/// FV 短期历史长度（用于判定「上涨」）
-const FV_HISTORY_LEN: usize = 10;
 /// Poly 最小报价单位（1 美分）
 const TICK: f64 = 0.01;
 /// 追涨侧 Maker 买挂单数量（张）—— Polymarket 强制 5 张最低，此处用 100 张作资金体量
 const MAKER_BUY_CHASE_MIN_QTY: f64 = 100.0;
+/// Polymarket 最低订单数量（张）。配平缺口低于该值时跳过，避免实盘拒单。
+const MIN_ORDER_QTY: f64 = 5.0;
 /// Merge 触发：可配对张数 ≥ 此值时进行虚拟 merge（凑够 5 对再 merge，省 gas 但模拟里无此约束）
 const MERGE_TRIGGER_PAIR_QTY: f64 = 1.0;
 /// Merge 节流：两次 merge 至少间隔此毫秒数
@@ -86,18 +88,23 @@ const SAFETY_MARGIN: f64 = 0.05;
 /// v0.4.13 配平腿专用 margin：target = (1 - opp.avg) - REBALANCE_MARGIN
 /// 配平腿不抓 lead alpha，只锁套利空间。0.02 = 留 2c 给 fee + 滑点，余下确定净利。
 const REBALANCE_MARGIN: f64 = 0.02;
-/// Maker 挂单超时（毫秒）：挂单超过此时间未 fill → cancel
-/// v0.4.15: 3s → 5s（实测最近 50min 6/11 窗口因 timeout 失配 → 1 笔 stuck 单边。延长拯救 50% 单边）
-const MAKER_TIMEOUT_MS: i64 = 5000;
-/// FV 移动 ≥ 此 tick 数时 cancel + 重挂新价（防 BTC 反向时被 adverse fill）
-const REPRICE_TICK_THRESH: f64 = 0.02; // 2 tick
-/// 距窗口结束 < 此分钟数时停止建仓（chase 路径 + 偏仓首次进入路径都禁）
-/// v0.4.15: 0.5 → 1.5（实证：末段建仓导致"1 笔 stuck 单边"窗口占 50%）
-/// 1.5min 给配对腿足够时间 fill；剩余 < 1.5min 不再建新仓
+/// v0.4.15 IOC walk-the-book：chase 腿允许吃簿到 target + 此滑点（cent）。
+/// 上限来自 CHASE_GAP_MIN(10c) - SAFETY_MARGIN(5c) = 5c 容差，砍一半给未来反弹空间。
+const CHASE_WORST_SLIPPAGE: f64 = 0.03;
+/// v0.4.15 IOC walk-the-book：配平腿 worst = (1 - opp.avg) - 此预算。
+/// 与 REBAL_HEALTH_MAX=0.98 严格对齐：吃完后 avg_sum < 0.98，每对 merge 至少锁 2c 利润。
+const REBAL_WORST_HEAD_ROOM: f64 = 0.02;
+/// FV 移动 ≥ 此 tick 数时视为目标已变化，IOC 评估不再走旧 target（仅观察用）。
+const REPRICE_TICK_THRESH: f64 = 0.02;
+/// 距窗口结束 < 此分钟数时停止新建 chase 仓。
+/// v0.4.15: 0.5 → 1.5，避免末段建仓导致单边卡死。
 const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 1.5;
-/// 距窗口结束 < 此分钟数时配平腿仍允许（拯救已建仓的偏仓）
-/// 0.5min 是 force_merge 的下限，> 0.5min 仍允许配平挂单 fill
+/// 距窗口结束 < 此分钟数时配平腿仍允许，拯救已建仓偏仓。
 const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.5;
+/// Poly WS 数据新鲜度守门：距上次 poly 事件超过此毫秒则禁止建仓。
+/// 1500ms 来自 lead P95=2.4s；Poly 静默超 1.5s 说明 WS 中断或 token 未订阅，
+/// 基于陈旧 best 价走簿会打穿 worst_price 拿到错误 fill。
+const POLY_STALE_MS: u64 = 1500;
 /// Merge 守门：avg_sum > 1.0 + EPS 时拒绝 merge（避免主动锁亏）。
 /// 等价于"配错方向后等待 redeem 而非主动 merge 锁定亏损"。
 const MERGE_AVG_SUM_MAX: f64 = 1.0;
@@ -108,7 +115,8 @@ const FORCE_MERGE_EXPIRY_MIN: f64 = 1.0;
 
 /// IV EMA 平滑系数 α。每帧反解出的 IV 加权 α，旧值加权 (1-α)。
 /// α=0.02 ≈ 时间常数 50 帧 ≈ 5s @ 100ms/tick。让 σ 反映市场共识但不被 Binance 瞬时跳动吸收。
-const SIGMA_EMA_ALPHA: f64 = 0.02;
+///
+/// 已迁移到 strategy::fv 模块，此处保留常量占位避免 grep 漏网。
 
 pub struct SignalEngine {
     config: AppConfig,
@@ -121,12 +129,8 @@ pub struct SignalEngine {
     last_was_steady: bool,
     /// 激变态快照：按窗口写 CSV，保留最近 10 个 5 分钟市场
     excited_snapshot_writer: ExcitedSnapshotWriter,
-    /// FV_up 短期历史（判定上涨）
-    fv_up_history: VecDeque<f64>,
-    /// FV_down 短期历史（判定上涨）
-    fv_down_history: VecDeque<f64>,
-    /// EMA 平滑后的 IV（来自 Poly 反解），用于 BS 定价。0 表示尚未初始化。
-    sigma_ema: f64,
+    /// FV 引擎：托管 σ_ema、FV 历史，封装 BS 反解+定价
+    fv_engine: FvEngine,
     /// 全量快照采集器（v0.3.3）：每个 BookTicker / PolyBookUpdate 都落盘
     fv_snapshot_writer: FvSnapshotWriter,
     /// v0.4.5: 同侧 taker buy 节流时间戳
@@ -146,22 +150,11 @@ impl SignalEngine {
             binance_mid_history: VecDeque::with_capacity(200),
             last_was_steady: false,
             excited_snapshot_writer: ExcitedSnapshotWriter::new(),
-            fv_up_history: VecDeque::with_capacity(FV_HISTORY_LEN + 5),
-            fv_down_history: VecDeque::with_capacity(FV_HISTORY_LEN + 5),
-            sigma_ema: 0.0,
+            fv_engine: FvEngine::new(),
             fv_snapshot_writer: FvSnapshotWriter::new(),
             last_taker_up_ts_ms: 0,
             last_taker_down_ts_ms: 0,
         }
-    }
-
-    /// FV 是否在上涨：当前值 > 近期均值
-    fn fv_rising(history: &VecDeque<f64>, current: f64) -> bool {
-        if history.len() < 3 {
-            return false;
-        }
-        let mean: f64 = history.iter().sum::<f64>() / history.len() as f64;
-        current > mean
     }
 
     /// 过去 5 秒、1 秒内币安 mid 的波动 (max - min)，用于稳态/激变态判定
@@ -212,683 +205,496 @@ impl SignalEngine {
 
     fn handle_event(&mut self, event: MarketEvent) {
         match event {
-            // ── Book Ticker ──────────────────────────────────────────
-            MarketEvent::BookTicker { data, .. } => {
-                if let Ok(bba) = BestBidAsk::try_from(&data) {
-                    let spread = bba.spread_bps();
-                    let mid = bba.mid_price();
-                    let now_ts_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-
-                    // 更新币安 mid 历史，用于稳态/激变态判定
-                    self.binance_mid_history.push_back((now_ts_ms, mid));
-                    let cutoff_5s = now_ts_ms.saturating_sub(5000);
-                    while self.binance_mid_history.front().map(|&(t, _)| t < cutoff_5s).unwrap_or(false) {
-                        self.binance_mid_history.pop_front();
-                    }
-
-                    // 闭包外预读 sigma_ema（self 字段），让 read-lock 闭包能用、闭包外能写
-                    let sigma_ema_prev = self.sigma_ema;
-                    let (strike, expiry_min, sigma, sigma_used_default, sigma_source, market_state, sticky_vol, current_poly_p, steady, iv_raw_for_ema) =
-                        if let Ok(s) = self.state.read() {
-                            let s = &*s;
-                            let now_ts = chrono::Utc::now().timestamp();
-                            let expiry_min = if s.poly_window_end_ts <= 0 {
-                                5.0
-                            } else {
-                                ((s.poly_window_end_ts - now_ts) as f64 / 60.0).max(0.0)
-                            };
-                            let strike = if s.strike_price > 0.0 { s.strike_price } else { mid.round() };
-                            let up_valid = s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0;
-                            let down_valid = s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0;
-                            // Up 中价（用于反解 IV：BS 给出的是 Up 概率）
-                            let up_mid = up_valid.then(|| {
-                                let (lo, hi) = (
-                                    s.poly_best_bid.min(s.poly_best_ask),
-                                    s.poly_best_bid.max(s.poly_best_ask),
-                                );
-                                (lo + hi) / 2.0
-                            });
-                            // Down 中价；Up + Down ≈ 1，无 Up 时用 1 - Down 作为隐含 Up 价
-                            let down_mid = down_valid.then(|| {
-                                let (lo, hi) = (
-                                    s.poly_down_best_bid.min(s.poly_down_best_ask),
-                                    s.poly_down_best_bid.max(s.poly_down_best_ask),
-                                );
-                                (lo + hi) / 2.0
-                            });
-                            let current_poly_p = up_mid
-                                .unwrap_or_else(|| down_mid.map(|d| (1.0 - d).clamp(0.0, 1.0)).unwrap_or(0.5));
-                            let t_years = bs_model::minutes_to_years(expiry_min);
-
-                            let (move_5s, move_1s) = self.move_range(now_ts_ms);
-                            let (poly_spread, has_poly) = if up_valid {
-                                ((s.poly_best_ask - s.poly_best_bid).max(0.0), true)
-                            } else if down_valid {
-                                ((s.poly_down_best_ask - s.poly_down_best_bid).max(0.0), true)
-                            } else {
-                                (1.0, false)
-                            };
-                            let poly_spread_narrow = poly_spread < POLY_SPREAD_NARROW_MAX;
-
-                            // 稳态：币安 5s 波动小、1s 未暴动、Poly 价差窄且有效
-                            let steady = move_5s < STEADY_MOVE_5S_MAX
-                                && move_1s < EXCITED_MOVE_1S_MIN
-                                && has_poly
-                                && poly_spread_narrow;
-
-                            // 前瞻 FV (v0.3.2-5m)：σ 来自「Poly IV 反解 + EMA 平滑」，FV = N(d2(S_now, K, T, σ_ema))
-                            //   - 反解保留：σ 数值与 Poly 共识对齐（市场对未来波动的预期）
-                            //   - EMA 平滑（α=0.02，τ≈5s）：吸收掉 Binance 瞬时跳动对 IV 的虚假压低
-                            //   - 当 Binance 跳但 Poly 没跟：iv_raw 瞬时下跌，σ_ema 几乎不动 → d2 因 S 上升而上升 → FV 正确追涨
-                            //   详见 docs/forward-looking-fv.md
-                            let smin = self.config.trading.volatility_sigma_min;
-                            let smax_poly = self.config.trading.volatility_sigma_max_poly;
-                            let iv_raw = if has_poly {
-                                bs_model::find_implied_volatility(mid, strike, t_years, current_poly_p)
-                            } else {
-                                0.0
-                            };
-                            // 稳态优先用 Poly IV 喂 EMA；激变态时反解 IV 不可信，跳过本帧 EMA 更新
-                            let _sigma_ema_alpha = SIGMA_EMA_ALPHA; // 留作后续配置化的 hook
-                            // σ 选择优先级：
-                            //   1. 已初始化的 σ_ema（最稳）：用 EMA 平滑值，吸收 Binance 瞬时 noise
-                            //   2. 首次启动 + 稳态 + iv_raw 有效：直接用 iv_raw 初始化
-                            //   3. 粘性 σ
-                            //   4. 默认 σ
-                            let (sigma, used_default, source, new_sticky) = if sigma_ema_prev > 0.01 {
-                                let sig = sigma_ema_prev.clamp(smin, smax_poly);
-                                (sig, false, "Poly IV (EMA)", sigma_ema_prev)
-                            } else if steady && iv_raw > 0.01 {
-                                let sig = iv_raw.clamp(smin, smax_poly);
-                                (sig, false, "Poly IV (init)", iv_raw)
-                            } else {
-                                let sticky = s.sticky_volatility;
-                                if sticky > 0.0 {
-                                    (sticky, false, "粘性", sticky)
-                                } else {
-                                    (
-                                        self.config.trading.default_volatility_annual,
-                                        true,
-                                        "默认",
-                                        s.sticky_volatility,
-                                    )
-                                }
-                            };
-
-                            let mkt_state = if steady { "稳态" } else { "激变态" };
-                            (
-                                strike,
-                                expiry_min,
-                                sigma,
-                                used_default,
-                                source.to_string(),
-                                mkt_state.to_string(),
-                                new_sticky,
-                                current_poly_p,
-                                steady,
-                                iv_raw,
-                            )
-                        } else {
-                            (
-                                96000.0,
-                                5.0,
-                                self.config.trading.default_volatility_annual,
-                                true,
-                                "默认".to_string(),
-                                "—".to_string(),
-                                0.0,
-                                0.5,
-                                false,
-                                0.0,
-                            )
-                        };
-
-                    // σ_ema 更新（闭包外，自由可变）：仅在稳态且 iv_raw 有效时喂 EMA，避免激变态污染
-                    if steady && iv_raw_for_ema > 0.01 && iv_raw_for_ema < 5.0 {
-                        if self.sigma_ema <= 0.0 {
-                            self.sigma_ema = iv_raw_for_ema; // 首次初始化
-                        } else {
-                            self.sigma_ema = SIGMA_EMA_ALPHA * iv_raw_for_ema
-                                + (1.0 - SIGMA_EMA_ALPHA) * self.sigma_ema;
-                        }
-                    }
-
-                    let fair_p = bs_model::calculate_binary_call_price(
-                        mid,
-                        strike,
-                        bs_model::minutes_to_years(expiry_min),
-                        sigma,
-                    );
-                    let fair_down = (1.0 - fair_p).clamp(0.0, 1.0);
-
-                    let iv_poly = bs_model::find_implied_volatility(
-                        mid,
-                        strike,
-                        bs_model::minutes_to_years(expiry_min),
-                        current_poly_p,
-                    );
-
-                    // FV 历史用于追涨「上涨」判定
-                    self.fv_up_history.push_back(fair_p);
-                    self.fv_down_history.push_back(fair_down);
-                    while self.fv_up_history.len() > FV_HISTORY_LEN {
-                        self.fv_up_history.pop_front();
-                    }
-                    while self.fv_down_history.len() > FV_HISTORY_LEN {
-                        self.fv_down_history.pop_front();
-                    }
-
-                    let mut excited_snap: Option<(i64, SnapshotRow)> = None;
-                    if let Ok(mut s) = self.state.write() {
-                        s.best_bid = bba.bid;
-                        s.best_ask = bba.ask;
-                        s.mid_price = mid;
-                        s.spread_bps = spread;
-                        s.fair_price = fair_p;
-                        s.fair_price_down = fair_down;
-                        s.expiry_minutes = expiry_min;
-                        s.volatility_annual = sigma;
-                        s.sigma_used_default = sigma_used_default;
-                        s.sigma_source = sigma_source;
-                        s.market_state = market_state;
-                        s.sticky_volatility = sticky_vol;
-                        s.iv_poly = iv_poly;
-                        let gap_bps_raw = (fair_p - current_poly_p).abs() / current_poly_p.max(0.02).max(1e-9) * 10000.0;
-                        s.signal_gap_bps = gap_bps_raw.min(9999.0);
-
-                        // 稳态→激变态且当前无 lead：开启一次领先，并尝试记录负延迟
-                        if self.last_was_steady && !steady && s.excited_lead.is_none() {
-                            let lead_start = Instant::now();
-                            s.excited_lead = Some(ExcitedLead {
-                                lead_start,
-                                fv_lead: fair_p,
-                                poly_mid_lead: current_poly_p,
-                            });
-                            // 负延迟：Poly 先动我们后判定；找最近一次同向且早于 lead_start 的 Poly 变动
-                            let fv_dir = fair_p - current_poly_p;
-                            if let Some((move_instant, move_mid)) = s
-                                .recent_poly_moves
-                                .iter()
-                                .rev()
-                                .find(|(inst, m)| {
-                                    *inst < lead_start
-                                        && (m - current_poly_p) * fv_dir >= 0.0
-                                        && (m - current_poly_p).abs() >= POLY_MOVE_THRESH
-                                })
-                                .copied()
-                            {
-                                let neg_ms = (lead_start - move_instant).as_millis() as f64;
-                                s.delay_stats.record_neg_ms(neg_ms);
-                            }
-                        }
-
-                        // 激变态快照：按 5 分钟窗口写 CSV（Binance 事件）
-                        if !steady && s.poly_window_end_ts > 0 {
-                            excited_snap = Some((
-                                s.poly_window_end_ts,
-                                SnapshotRow {
-                                    t_ms: chrono::Utc::now().timestamp_millis(),
-                                    fv_up: fair_p,
-                                    fv_down: fair_down,
-                                    poly_up_bid: s.poly_best_bid,
-                                    poly_up_ask: s.poly_best_ask,
-                                    poly_down_bid: s.poly_down_best_bid,
-                                    poly_down_ask: s.poly_down_best_ask,
-                                    source: b'B',
-                                },
-                            ));
-                        }
-
-                    }
-
-                    // 全量快照（v0.3.3）：每个 BookTicker 都落一行，毫秒级时间戳
-                    let win_end = self
-                        .state
-                        .read()
-                        .map(|s| s.poly_window_end_ts)
-                        .unwrap_or(0);
-                    if win_end > 0 {
-                        let st_byte = if steady { b'S' } else { b'E' };
-                        let (pub_, pua, pdb, pda) = self
-                            .state
-                            .read()
-                            .map(|s| (s.poly_best_bid, s.poly_best_ask, s.poly_down_best_bid, s.poly_down_best_ask))
-                            .unwrap_or((0.0, 0.0, 0.0, 0.0));
-                        self.fv_snapshot_writer.push(
-                            win_end,
-                            FvRow {
-                                t_ms: chrono::Utc::now().timestamp_millis(),
-                                source: b'B',
-                                binance_mid: mid,
-                                fv_up: fair_p,
-                                fv_down: fair_down,
-                                poly_up_bid: pub_,
-                                poly_up_ask: pua,
-                                poly_down_bid: pdb,
-                                poly_down_ask: pda,
-                                sigma,
-                                iv_raw: iv_raw_for_ema,
-                                sigma_ema: self.sigma_ema,
-                                market_state: st_byte,
-                                expiry_min,
-                                strike,
-                            },
-                        );
-                    }
-                    // 追涨侧与 Maker 买意图（在写锁外计算，避免 self 与 s 同时借用）
-                    let (
-                        poly_up_mid,
-                        poly_down_mid,
-                        up_ask,
-                        down_ask,
-                        _proj_avg_sum,
-                        _proj_qty_up,
-                        _proj_qty_down,
-                        rebalance_buy_up,
-                        rebalance_buy_down,
-                        rebalance_qty_up,
-                        rebalance_qty_down,
-                        avg_after_up,
-                        avg_after_down,
-                    ) = if let Ok(s) = self.state.read() {
-                        let up = if s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0 {
-                            (s.poly_best_bid + s.poly_best_ask) / 2.0
-                        } else {
-                            0.0
-                        };
-                        let down = if s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0 {
-                            (s.poly_down_best_bid + s.poly_down_best_ask) / 2.0
-                        } else {
-                            0.0
-                        };
-                        let proj_avg = s.projected_avg_sum_after_intents();
-                        let proj_up = s.projected_qty_up_after_intents();
-                        let proj_down = s.projected_qty_down_after_intents();
-                        let up_ask = s.poly_best_ask;
-                        let down_ask = s.poly_down_best_ask;
-                        let price_up = (up_ask - TICK).max(0.0);
-                        let price_down = (down_ask - TICK).max(0.0);
-                        let rebalance_qty_up = (proj_down - proj_up).max(0.0);
-                        let rebalance_qty_down = (proj_up - proj_down).max(0.0);
-                        let avg_sum_after_rebalance_up = s.avg_sum_if_buy_filled(ChaseSide::Up, price_up, rebalance_qty_up);
-                        let avg_sum_after_rebalance_down = s.avg_sum_if_buy_filled(ChaseSide::Down, price_down, rebalance_qty_down);
-                        let rebalance_ok_up = proj_avg < 1.0 && rebalance_qty_up > 0.0 && avg_sum_after_rebalance_up < 1.0 && up_ask > 0.0;
-                        let rebalance_ok_down = proj_avg < 1.0 && rebalance_qty_down > 0.0 && avg_sum_after_rebalance_down < 1.0 && down_ask > 0.0;
-                        (
-                            up,
-                            down,
-                            up_ask,
-                            down_ask,
-                            proj_avg,
-                            proj_up,
-                            proj_down,
-                            rebalance_ok_up,
-                            rebalance_ok_down,
-                            rebalance_qty_up,
-                            rebalance_qty_down,
-                            avg_sum_after_rebalance_up,
-                            avg_sum_after_rebalance_down,
-                        )
-                    } else {
-                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false, false, 0.0, 0.0, 0.0, 0.0)
-                    };
-                    // v0.4.5 taker-only：追涨/配平直接 taker 吃 best_ask，立即成交
-                    //   底层逻辑：lead-lag 实证 1.1-2.5s alpha 必须 taker 才能抓到
-                    //   maker 模式 fill 总在反转/卖压时（adverse selection），把 alpha 反转为劣势
-                    let in_excited = !steady;
-                    // v0.4.15: 双窗口守门 — 建仓腿严（≥1.5min），配平腿宽（≥0.5min）
-                    let in_chase_window = expiry_min >= MIN_EXPIRY_MIN_FOR_CHASE;
-                    let in_rebal_window = expiry_min >= MIN_EXPIRY_MIN_FOR_REBAL;
-                    let up_chase = CHASE_ONLY_IN_EXCITED && in_excited && in_chase_window
-                        && poly_up_mid > 0.0
-                        && (fair_p - poly_up_mid) >= CHASE_GAP_MIN
-                        && Self::fv_rising(&self.fv_up_history, fair_p);
-                    let down_chase = CHASE_ONLY_IN_EXCITED && in_excited && in_chase_window
-                        && poly_down_mid > 0.0
-                        && (fair_down - poly_down_mid) >= CHASE_GAP_MIN
-                        && Self::fv_rising(&self.fv_down_history, fair_down);
-                    let chase_side = if up_chase {
-                        Some(ChaseSide::Up)
-                    } else if down_chase {
-                        Some(ChaseSide::Down)
-                    } else {
-                        None
-                    };
-                    // Taker 吃单价 = best_ask（不再用 best_ask − 1c 的 maker 价）
-                    let taker_price_up = up_ask;
-                    let taker_price_down = down_ask;
-                    // 守门 #1: 单边价上限 0.85（防尾部）
-                    let price_up_ok = taker_price_up > 0.0 && taker_price_up <= MAX_BUY_PRICE;
-                    let price_down_ok = taker_price_down > 0.0 && taker_price_down <= MAX_BUY_PRICE;
-                    // v0.4.6 守门 #4 force-balance（E0）：只允许买"持仓 ≤ 对侧 + slack" 的方向
-                    // v0.4.10 守门 #5 pair-health（C2 cost-aware）：fill 后 avg_sum 必须 < PAIR_HEALTH_MAX
-                    let (qty_up_now, qty_down_now, avg_up_now, avg_down_now) = if let Ok(s) = self.state.read() {
-                        (s.position_up.qty, s.position_down.qty,
-                         s.position_up.avg_price, s.position_down.avg_price)
-                    } else {
-                        (0.0, 0.0, 0.0, 0.0)
-                    };
-                    let balance_ok_up = qty_up_now <= qty_down_now + FORCE_BALANCE_SLACK;
-                    let balance_ok_down = qty_down_now <= qty_up_now + FORCE_BALANCE_SLACK;
-                    // v0.4.14 双标准健康守门：建仓腿宽松 1.05（用 ask proxy），配平腿严格 0.98（防 avg_sum 漂移）
-                    let qty_chase = MAKER_BUY_CHASE_MIN_QTY;
-                    let new_avg_up_after = if qty_up_now + qty_chase > 0.0 {
-                        (qty_up_now * avg_up_now + taker_price_up * qty_chase) / (qty_up_now + qty_chase)
-                    } else { taker_price_up };
-                    let new_avg_down_after = if qty_down_now + qty_chase > 0.0 {
-                        (qty_down_now * avg_down_now + taker_price_down * qty_chase) / (qty_down_now + qty_chase)
-                    } else { taker_price_down };
-                    // 建仓腿（对侧空仓）：用 ask 当 proxy，宽松 < 1.05（容许 Polymarket spread 1c）
-                    // 配平腿（对侧已有持仓）：用真实 avg，严格 < 0.98（确保 fill 后 avg_sum 不漂出健康区）
-                    let pair_health_ok_up = if qty_down_now > 0.0 {
-                        (new_avg_up_after + avg_down_now) < REBAL_HEALTH_MAX
-                    } else {
-                        let opp_proxy = if taker_price_down > 0.0 { taker_price_down } else { 0.5 };
-                        (new_avg_up_after + opp_proxy) < PAIR_HEALTH_MAX
-                    };
-                    let pair_health_ok_down = if qty_up_now > 0.0 {
-                        (avg_up_now + new_avg_down_after) < REBAL_HEALTH_MAX
-                    } else {
-                        let opp_proxy = if taker_price_up > 0.0 { taker_price_up } else { 0.5 };
-                        (opp_proxy + new_avg_down_after) < PAIR_HEALTH_MAX
-                    };
-                    // v0.4.14 回归 v0.4.11 chase target — 删除 max(rebal) 抬高 target 的反向 bug
-                    // 实证：max(chase, rebal) 让 best_ask 几乎总 ≤ target → 70% 走 taker（设计本意 maker）
-                    // → 回归 target = FV - SAFETY_MARGIN，配平腿同样挂 maker 等价格跌到位
-                    // 单向市挂不 fill 接受（5s timeout 无成本）；震荡市享 maker rebate
-                    let target_up = (fair_p - SAFETY_MARGIN).max(0.0);
-                    let target_down = (fair_down - SAFETY_MARGIN).max(0.0);
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-
-                    // ① 先处理 pending maker 挂单：fill / timeout / reprice
-                    if let Ok(mut s) = self.state.write() {
-                        let (ub, ua, db, da) = (s.poly_best_bid, s.poly_best_ask, s.poly_down_best_bid, s.poly_down_best_ask);
-                        // UP 侧 pending
-                        if let Some((p, q, placed_ts)) = s.maker_buy_intent_up {
-                            if ua > 0.0 && ua <= p {
-                                s.apply_fill(ChaseSide::Up, true, true /*maker*/, p, q, now_ms, ub, ua, db, da);
-                                self.last_taker_up_ts_ms = now_ms;
-                                s.maker_buy_intent_up = None;
-                            } else if now_ms - placed_ts > MAKER_TIMEOUT_MS {
-                                s.maker_buy_intent_up = None;
-                            } else if (target_up - p).abs() >= REPRICE_TICK_THRESH {
-                                s.maker_buy_intent_up = None;
-                            }
-                        }
-                        // DOWN 侧 pending
-                        if let Some((p, q, placed_ts)) = s.maker_buy_intent_down {
-                            if da > 0.0 && da <= p {
-                                s.apply_fill(ChaseSide::Down, true, true /*maker*/, p, q, now_ms, ub, ua, db, da);
-                                self.last_taker_down_ts_ms = now_ms;
-                                s.maker_buy_intent_down = None;
-                            } else if now_ms - placed_ts > MAKER_TIMEOUT_MS {
-                                s.maker_buy_intent_down = None;
-                            } else if (target_down - p).abs() >= REPRICE_TICK_THRESH {
-                                s.maker_buy_intent_down = None;
-                            }
-                        }
-
-                        // 稳态时清 chase_side（停 chase 显示）
-                        // v0.4.11 修正：不再清 maker_buy_intent — 偏仓配平挂单在稳态需保留
-                        if steady {
-                            s.chase_side = None;
-                        } else {
-                            s.chase_side = chase_side;
-                        }
-                        s.rebalance_hint_up = if rebalance_buy_up { Some((rebalance_qty_up, avg_after_up)) } else { None };
-                        s.rebalance_hint_down = if rebalance_buy_down { Some((rebalance_qty_down, avg_after_down)) } else { None };
-                    }
-
-                    // ② 决策是否新建仓 — 两条独立路径
-                    // A) chase 路径（吃 lead alpha）：受激变态守门 + 节流；建仓腿只在激变 + lead 信号
-                    // B) 偏仓配平路径（锁套利）：稳态也允许 + 不受节流；只要对侧已落后即触发
-                    let imbalanced_up_needed = qty_down_now > qty_up_now;   // UP 落后，要补 UP
-                    let imbalanced_dn_needed = qty_up_now > qty_down_now;   // DOWN 落后，要补 DOWN
-
-                    // chase 触发：必须激变 + lead 信号 + force-balance + 1s 节流
-                    let chase_buy_up = up_chase && balance_ok_up && in_excited
-                        && now_ms - self.last_taker_up_ts_ms >= TAKER_BUY_INTERVAL_MS;
-                    let chase_buy_down = down_chase && balance_ok_down && in_excited
-                        && now_ms - self.last_taker_down_ts_ms >= TAKER_BUY_INTERVAL_MS;
-
-                    // 偏仓配平：稳态也允许，无激变态守门，无节流（挂单慢动作）
-                    // v0.4.15: 用 in_rebal_window (≥0.5min) — 末段仍允许配平救已建仓
-                    let rebalance_buy_up_path = imbalanced_up_needed && in_rebal_window;
-                    let rebalance_buy_down_path = imbalanced_dn_needed && in_rebal_window;
-
-                    let trigger_up = chase_buy_up || rebalance_buy_up_path;
-                    let trigger_down = chase_buy_down || rebalance_buy_down_path;
-
-                    let want_buy_up = trigger_up
-                        && pair_health_ok_up
-                        && target_up > 0.0 && target_up <= MAX_BUY_PRICE;
-                    let want_buy_down = trigger_down
-                        && pair_health_ok_down
-                        && target_down > 0.0 && target_down <= MAX_BUY_PRICE;
-
-                    // ③ 实施：best_ask ≤ 目标 → 立即 taker；否则挂 maker
-                    // 不再用 !steady 一刀切守门 — 偏仓配平路径在稳态也要工作
-                    if want_buy_up || want_buy_down {
-                        if let Ok(mut s) = self.state.write() {
-                            let (ub, ua, db, da) = (s.poly_best_bid, s.poly_best_ask, s.poly_down_best_bid, s.poly_down_best_ask);
-                            if want_buy_up && s.maker_buy_intent_up.is_none() {
-                                if ua > 0.0 && ua <= target_up {
-                                    s.apply_fill(ChaseSide::Up, true, false /*taker*/, ua, MAKER_BUY_CHASE_MIN_QTY, now_ms, ub, ua, db, da);
-                                    self.last_taker_up_ts_ms = now_ms;
-                                } else {
-                                    s.maker_buy_intent_up = Some((target_up, MAKER_BUY_CHASE_MIN_QTY, now_ms));
-                                }
-                            }
-                            if want_buy_down && s.maker_buy_intent_down.is_none() {
-                                if da > 0.0 && da <= target_down {
-                                    s.apply_fill(ChaseSide::Down, true, false, da, MAKER_BUY_CHASE_MIN_QTY, now_ms, ub, ua, db, da);
-                                    self.last_taker_down_ts_ms = now_ms;
-                                } else {
-                                    s.maker_buy_intent_down = Some((target_down, MAKER_BUY_CHASE_MIN_QTY, now_ms));
-                                }
-                            }
-                        }
-                    }
-                    if let Some((win, row)) = excited_snap {
-                        self.excited_snapshot_writer.push_snapshot(win, row);
-                    }
-                    self.last_was_steady = steady;
-                }
-            }
-
-            // ── Depth Update ─────────────────────────────────────────
-            MarketEvent::Depth { data, .. } => match self.orderbook.apply_depth_update(&data) {
-                Ok(_) if self.orderbook.is_ready() => {
-                    if let Ok(mut s) = self.state.write() {
-                        s.bids = self
-                            .orderbook
-                            .top_bids(10)
-                            .into_iter()
-                            .map(|(p, q)| BookLevel { price: p, qty: q })
-                            .collect();
-                        s.asks = self
-                            .orderbook
-                            .top_asks(10)
-                            .into_iter()
-                            .map(|(p, q)| BookLevel { price: p, qty: q })
-                            .collect();
-                    }
-                }
-                Err(e) if e.to_string() == "orderbookgap" => {
-                    warn!("订单簿不连续，已重置");
-                }
-                _ => {}
-            },
-
-            // ── AggTrade ─────────────────────────────────────────────
-            MarketEvent::AggTrade { data, .. } => {
-                if let Ok(trade) = Trade::try_from(&data) {
-                    let is_buy = trade.is_taker_buy();
-                    let dir = if is_buy { "▲" } else { "▼" };
-                    
-                    // 更新滚动波动率（仅喂价与时间戳；年化 σ 在 BookTicker 中按到期 T 对齐计算）
-                    self.vol_calc.update(trade.price, trade.trade_time_ms);
-
-                    // 计算网络延迟 (ms) = 本机接收时间 - 交易所成交时间
-                    let now_ms = (Local::now().timestamp_nanos_opt().unwrap_or(0) / 1_000_000) as u64;
-                    let net_latency = now_ms.saturating_sub(trade.trade_time_ms);
-
-                    let row = TradeRow {
-                        dir_time: format!("{} {}", dir, Local::now().format("%H:%M:%S")),
-                        is_buy,
-                        price: trade.price,
-                        qty: trade.quantity,
-                        notional: trade.notional(),
-                    };
-                    if let Ok(mut s) = self.state.write() {
-                        let s: &mut AppState = &mut *s;
-                        s.push_trade(row);
-                        // 更新延迟展示数据
-                        s.latency.p50_ms = net_latency as f64; // 简化处理，直接显示当前值
-                    }
-                }
-            }
-
-            MarketEvent::PolyBookUpdate { .. } => {
-                let mut excited_snap: Option<(i64, SnapshotRow)> = None;
-                let mut fv_snap_pending: Option<(i64, FvRow)> = None;
-                if let Ok(mut s) = self.state.write() {
-                    // 与 BookTicker 一致：用 Up 中价（有 Up 用 Up，无则用 1 - Down）
-                    let poly_mid = {
-                        let up = s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0;
-                        let down = s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0;
-                        if up {
-                            (s.poly_best_bid + s.poly_best_ask) / 2.0
-                        } else if down {
-                            1.0 - (s.poly_down_best_bid + s.poly_down_best_ask) / 2.0
-                        } else {
-                            s.last_poly_mid
-                        }
-                    };
-                    s.poly_btc_offset = poly_mid - s.mid_price;
-
-                    // 近期 Poly 明显变动（保留约 5s，用于负延迟）
-                    let five_sec = Duration::from_secs(5);
-                    while s
-                        .recent_poly_moves
-                        .front()
-                        .map(|(i, _)| i.elapsed() > five_sec)
-                        .unwrap_or(false)
-                    {
-                        s.recent_poly_moves.pop_front();
-                    }
-                    if (poly_mid - s.last_poly_mid).abs() >= POLY_MOVE_THRESH && s.last_poly_mid > 0.0 {
-                        s.recent_poly_moves.push_back((Instant::now(), poly_mid));
-                    }
-                    s.last_poly_mid = poly_mid;
-
-                    // 进行中的 lead：检查跟上或超时
-                    if let Some(lead) = s.excited_lead.as_ref() {
-                        let elapsed_ms = lead.lead_start.elapsed().as_millis();
-                        if elapsed_ms > LEAD_TIMEOUT_MS as u128 {
-                            s.excited_lead = None;
-                        } else if (poly_mid - lead.fv_lead).abs() < CATCHUP_EPSILON {
-                            let delay_ms = lead.lead_start.elapsed().as_millis() as f64;
-                            s.delay_stats.record_pos_ms(delay_ms);
-                            s.excited_lead = None;
-                        }
-                    }
-
-                    // 激变态快照（Poly 事件）：按 5 分钟窗口写 CSV
-                    if s.market_state == "激变态" && s.poly_window_end_ts > 0 {
-                        excited_snap = Some((
-                            s.poly_window_end_ts,
-                            SnapshotRow {
-                                t_ms: chrono::Utc::now().timestamp_millis(),
-                                fv_up: s.fair_price,
-                                fv_down: s.fair_price_down,
-                                poly_up_bid: s.poly_best_bid,
-                                poly_up_ask: s.poly_best_ask,
-                                poly_down_bid: s.poly_down_best_bid,
-                                poly_down_ask: s.poly_down_best_ask,
-                                source: b'P',
-                            },
-                        ));
-                    }
-
-                    // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
-                    let ts_ms = chrono::Utc::now().timestamp_millis();
-                    let (up_bid, up_ask, down_bid, down_ask) = (
-                        s.poly_best_bid,
-                        s.poly_best_ask,
-                        s.poly_down_best_bid,
-                        s.poly_down_best_ask,
-                    );
-                    // v0.4.11 marketable limit：PolyBookUpdate 时检查 maker 挂单 fill
-                    //   触发条件：best_ask ≤ 挂单价 (Poly 跌到目标价)
-                    if let Some((p, q, placed_ts)) = s.maker_buy_intent_up {
-                        if up_ask > 0.0 && up_ask <= p {
-                            s.apply_fill(ChaseSide::Up, true, true /*maker*/, p, q, ts_ms, up_bid, up_ask, down_bid, down_ask);
-                            s.maker_buy_intent_up = None;
-                        } else if ts_ms - placed_ts > MAKER_TIMEOUT_MS {
-                            s.maker_buy_intent_up = None;
-                        }
-                    }
-                    if let Some((p, q, placed_ts)) = s.maker_buy_intent_down {
-                        if down_ask > 0.0 && down_ask <= p {
-                            s.apply_fill(ChaseSide::Down, true, true /*maker*/, p, q, ts_ms, up_bid, up_ask, down_bid, down_ask);
-                            s.maker_buy_intent_down = None;
-                        } else if ts_ms - placed_ts > MAKER_TIMEOUT_MS {
-                            s.maker_buy_intent_down = None;
-                        }
-                    }
-
-                    // v0.4.0-5m：虚拟 merge 触发（替代旧浮亏 sell 减仓）
-                    //   底层逻辑：1 UP + 1 DOWN ≡ 1 USDC（Polymarket CTF mergePositions 任意时刻可调）
-                    //   触发条件：可配对张数 ≥ MERGE_TRIGGER_PAIR_QTY 且距上次 merge ≥ MERGE_INTERVAL_MS
-                    //   v0.4.1 P0 守门 #3：avg_sum > 1 时拒绝 merge（避免主动锁亏，等结算 redeem 兜底）
-                    //   v0.4.2 P1.2：窗口末段（expiry_min < FORCE_MERGE_EXPIRY_MIN）强制 merge：
-                    //     - 每对 merge=$1.00 与 redeem 数学等价
-                    //     - 即时锁定避免残仓过夜 gas + 清算时机风险
-                    //     - 强制忽略 avg_sum<1 守门（窗口末段没机会等改善）
-                    let mergeable = s.mergeable_pairs();
-                    let merge_throttle_ok = ts_ms - s.last_merge_ts_ms >= MERGE_INTERVAL_MS;
-                    let avg_sum_now = s.position_up.avg_price + s.position_down.avg_price;
-                    let force_merge = s.expiry_minutes < FORCE_MERGE_EXPIRY_MIN;
-                    let merge_avg_sum_ok = force_merge || avg_sum_now < MERGE_AVG_SUM_MAX;
-                    if mergeable >= MERGE_TRIGGER_PAIR_QTY && merge_throttle_ok && merge_avg_sum_ok {
-                        let pair_qty = mergeable.floor().max(MERGE_TRIGGER_PAIR_QTY);
-                        s.apply_merge(pair_qty, ts_ms);
-                    }
-                    // 全量快照（v0.3.3）：每个 PolyBookUpdate 都落一行
-                    if s.poly_window_end_ts > 0 {
-                        let st_byte = if s.market_state == "稳态" { b'S' } else { b'E' };
-                        fv_snap_pending = Some((
-                            s.poly_window_end_ts,
-                            FvRow {
-                                t_ms: chrono::Utc::now().timestamp_millis(),
-                                source: b'P',
-                                binance_mid: s.mid_price,
-                                fv_up: s.fair_price,
-                                fv_down: s.fair_price_down,
-                                poly_up_bid: s.poly_best_bid,
-                                poly_up_ask: s.poly_best_ask,
-                                poly_down_bid: s.poly_down_best_bid,
-                                poly_down_ask: s.poly_down_best_ask,
-                                sigma: s.volatility_annual,
-                                iv_raw: s.iv_poly,
-                                sigma_ema: self.sigma_ema,
-                                market_state: st_byte,
-                                expiry_min: s.expiry_minutes,
-                                strike: s.strike_price,
-                            },
-                        ));
-                    }
-                }
-                if let Some((win, row)) = excited_snap {
-                    self.excited_snapshot_writer.push_snapshot(win, row);
-                }
-                if let Some((win, row)) = fv_snap_pending {
-                    self.fv_snapshot_writer.push(win, row);
-                }
-            }
-
+            MarketEvent::BookTicker { data, .. } => self.handle_book_ticker(data),
+            MarketEvent::Depth { data, .. } => self.handle_depth(data),
+            MarketEvent::AggTrade { data, .. } => self.handle_agg_trade(data),
+            MarketEvent::PolyBookUpdate { .. } => self.handle_poly_book_update(),
             MarketEvent::Unknown { .. } => {}
+        }
+    }
+
+    /// Binance BookTicker → FV 重算 + decision + IOC 执行 + 全量快照落盘
+    fn handle_book_ticker(&mut self, data: crate::model::ticker::BookTickerData) {
+        if let Ok(bba) = BestBidAsk::try_from(&data) {
+            let spread = bba.spread_bps();
+            let mid = bba.mid_price();
+            let now_ts_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+            // 更新币安 mid 历史，用于稳态/激变态判定
+            self.binance_mid_history.push_back((now_ts_ms, mid));
+            let cutoff_5s = now_ts_ms.saturating_sub(5000);
+            while self
+                .binance_mid_history
+                .front()
+                .map(|&(t, _)| t < cutoff_5s)
+                .unwrap_or(false)
+            {
+                self.binance_mid_history.pop_front();
+            }
+
+            // 步骤 A：从 state 抽出 FV 计算所需的最小输入；释放读锁后再交给 FvEngine
+            let (strike, expiry_min, current_poly_p, has_poly, steady, sticky_in) = if let Ok(s) =
+                self.state.read()
+            {
+                let now_ts = chrono::Utc::now().timestamp();
+                let expiry_min = if s.poly_window_end_ts <= 0 {
+                    5.0
+                } else {
+                    ((s.poly_window_end_ts - now_ts) as f64 / 60.0).max(0.0)
+                };
+                let strike = if s.strike_price > 0.0 {
+                    s.strike_price
+                } else {
+                    mid.round()
+                };
+                let up_valid = s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0;
+                let down_valid = s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0;
+                let up_mid = up_valid.then(|| {
+                    let (lo, hi) = (
+                        s.poly_best_bid.min(s.poly_best_ask),
+                        s.poly_best_bid.max(s.poly_best_ask),
+                    );
+                    (lo + hi) / 2.0
+                });
+                let down_mid = down_valid.then(|| {
+                    let (lo, hi) = (
+                        s.poly_down_best_bid.min(s.poly_down_best_ask),
+                        s.poly_down_best_bid.max(s.poly_down_best_ask),
+                    );
+                    (lo + hi) / 2.0
+                });
+                let current_poly_p = up_mid
+                    .unwrap_or_else(|| down_mid.map(|d| (1.0 - d).clamp(0.0, 1.0)).unwrap_or(0.5));
+
+                let (move_5s, move_1s) = self.move_range(now_ts_ms);
+                let (poly_spread, has_poly) = if up_valid {
+                    ((s.poly_best_ask - s.poly_best_bid).max(0.0), true)
+                } else if down_valid {
+                    ((s.poly_down_best_ask - s.poly_down_best_bid).max(0.0), true)
+                } else {
+                    (1.0, false)
+                };
+                let poly_spread_narrow = poly_spread < POLY_SPREAD_NARROW_MAX;
+                let steady = move_5s < STEADY_MOVE_5S_MAX
+                    && move_1s < EXCITED_MOVE_1S_MIN
+                    && has_poly
+                    && poly_spread_narrow;
+                (
+                    strike,
+                    expiry_min,
+                    current_poly_p,
+                    has_poly,
+                    steady,
+                    s.sticky_volatility,
+                )
+            } else {
+                (96000.0, 5.0, 0.5, false, false, 0.0)
+            };
+            let market_state = if steady { "稳态" } else { "激变态" }.to_string();
+
+            // 步骤 B：FvEngine 一次性给出 σ / FV / iv_poly / FV 上涨判定
+            let fv = self.fv_engine.compute(FvInputs {
+                binance_mid: mid,
+                strike,
+                expiry_min,
+                poly_p: current_poly_p,
+                has_poly,
+                steady,
+                sticky_sigma: sticky_in,
+                sigma_min: self.config.trading.volatility_sigma_min,
+                sigma_max_poly: self.config.trading.volatility_sigma_max_poly,
+                default_sigma: self.config.trading.default_volatility_annual,
+            });
+            let fair_p = fv.fair_up;
+            let fair_down = fv.fair_down;
+            let sigma = fv.sigma;
+            let sigma_used_default = fv.sigma_used_default;
+            let sigma_source = fv.sigma_source.to_string();
+            let sticky_vol = fv.new_sticky;
+            let iv_raw_for_ema = fv.iv_raw;
+            let iv_poly = fv.iv_poly;
+
+            let mut excited_snap: Option<(i64, SnapshotRow)> = None;
+            if let Ok(mut s) = self.state.write() {
+                s.best_bid = bba.bid;
+                s.best_ask = bba.ask;
+                s.mid_price = mid;
+                s.spread_bps = spread;
+                s.fair_price = fair_p;
+                s.fair_price_down = fair_down;
+                s.expiry_minutes = expiry_min;
+                s.volatility_annual = sigma;
+                s.sigma_used_default = sigma_used_default;
+                s.sigma_source = sigma_source;
+                s.market_state = market_state;
+                s.sticky_volatility = sticky_vol;
+                s.iv_poly = iv_poly;
+                let gap_bps_raw =
+                    (fair_p - current_poly_p).abs() / current_poly_p.max(0.02).max(1e-9) * 10000.0;
+                s.signal_gap_bps = gap_bps_raw.min(9999.0);
+
+                // 稳态→激变态且当前无 lead：开启一次领先，并尝试记录负延迟
+                if self.last_was_steady && !steady && s.excited_lead.is_none() {
+                    let lead_start = Instant::now();
+                    s.excited_lead = Some(ExcitedLead {
+                        lead_start,
+                        fv_lead: fair_p,
+                        poly_mid_lead: current_poly_p,
+                    });
+                    // 负延迟：Poly 先动我们后判定；找最近一次同向且早于 lead_start 的 Poly 变动
+                    let fv_dir = fair_p - current_poly_p;
+                    if let Some((move_instant, move_mid)) = s
+                        .recent_poly_moves
+                        .iter()
+                        .rev()
+                        .find(|(inst, m)| {
+                            *inst < lead_start
+                                && (m - current_poly_p) * fv_dir >= 0.0
+                                && (m - current_poly_p).abs() >= POLY_MOVE_THRESH
+                        })
+                        .copied()
+                    {
+                        let neg_ms = (lead_start - move_instant).as_millis() as f64;
+                        s.delay_stats.record_neg_ms(neg_ms);
+                    }
+                }
+
+                // 激变态快照：按 5 分钟窗口写 CSV（Binance 事件）
+                if !steady && s.poly_window_end_ts > 0 {
+                    excited_snap = Some((
+                        s.poly_window_end_ts,
+                        SnapshotRow {
+                            t_ms: chrono::Utc::now().timestamp_millis(),
+                            fv_up: fair_p,
+                            fv_down: fair_down,
+                            poly_up_bid: s.poly_best_bid,
+                            poly_up_ask: s.poly_best_ask,
+                            poly_down_bid: s.poly_down_best_bid,
+                            poly_down_ask: s.poly_down_best_ask,
+                            source: b'B',
+                        },
+                    ));
+                }
+            }
+
+            // 全量快照（v0.3.3）：每个 BookTicker 都落一行，毫秒级时间戳
+            let win_end = self.state.read().map(|s| s.poly_window_end_ts).unwrap_or(0);
+            if win_end > 0 {
+                let st_byte = if steady { b'S' } else { b'E' };
+                let (pub_, pua, pdb, pda) = self
+                    .state
+                    .read()
+                    .map(|s| {
+                        (
+                            s.poly_best_bid,
+                            s.poly_best_ask,
+                            s.poly_down_best_bid,
+                            s.poly_down_best_ask,
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0));
+                self.fv_snapshot_writer.push(
+                    win_end,
+                    FvRow {
+                        t_ms: chrono::Utc::now().timestamp_millis(),
+                        source: b'B',
+                        binance_mid: mid,
+                        fv_up: fair_p,
+                        fv_down: fair_down,
+                        poly_up_bid: pub_,
+                        poly_up_ask: pua,
+                        poly_down_bid: pdb,
+                        poly_down_ask: pda,
+                        sigma,
+                        iv_raw: iv_raw_for_ema,
+                        sigma_ema: self.fv_engine.sigma_ema(),
+                        market_state: st_byte,
+                        expiry_min,
+                        strike,
+                    },
+                );
+            }
+            // 步骤 C：一次 read 装填 decision 所需的市场快照
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let snap = if let Ok(s) = self.state.read() {
+                let up_mid = if s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0 {
+                    (s.poly_best_bid + s.poly_best_ask) / 2.0
+                } else {
+                    0.0
+                };
+                let down_mid = if s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0 {
+                    (s.poly_down_best_bid + s.poly_down_best_ask) / 2.0
+                } else {
+                    0.0
+                };
+                let poly_fresh = s
+                    .poly_delay_ms()
+                    .map(|ms| ms <= POLY_STALE_MS)
+                    .unwrap_or(false);
+                MarketSnapshot {
+                    poly_up_mid: up_mid,
+                    poly_down_mid: down_mid,
+                    up_ask: s.poly_best_ask,
+                    down_ask: s.poly_down_best_ask,
+                    qty_up: s.ledger.position_up.qty,
+                    qty_down: s.ledger.position_down.qty,
+                    avg_up: s.ledger.position_up.avg_price,
+                    avg_down: s.ledger.position_down.avg_price,
+                    steady,
+                    expiry_min,
+                    poly_fresh,
+                }
+            } else {
+                MarketSnapshot {
+                    poly_up_mid: 0.0,
+                    poly_down_mid: 0.0,
+                    up_ask: 0.0,
+                    down_ask: 0.0,
+                    qty_up: 0.0,
+                    qty_down: 0.0,
+                    avg_up: 0.0,
+                    avg_down: 0.0,
+                    steady,
+                    expiry_min,
+                    poly_fresh: false,
+                }
+            };
+
+            // 步骤 D：纯函数 decision::build_intents → 0~2 笔 BuyIntent + 展示副作用
+            let thresholds = Thresholds {
+                chase_gap_min: CHASE_GAP_MIN,
+                safety_margin: SAFETY_MARGIN,
+                chase_worst_slippage: CHASE_WORST_SLIPPAGE,
+                rebal_worst_head_room: REBAL_WORST_HEAD_ROOM,
+                pair_health_max: PAIR_HEALTH_MAX,
+                rebal_health_max: REBAL_HEALTH_MAX,
+                max_buy_price: MAX_BUY_PRICE,
+                chase_min_qty: MAKER_BUY_CHASE_MIN_QTY,
+                min_order_qty: MIN_ORDER_QTY,
+                min_expiry_min_for_chase: MIN_EXPIRY_MIN_FOR_CHASE,
+                min_expiry_min_for_rebal: MIN_EXPIRY_MIN_FOR_REBAL,
+                taker_buy_interval_ms: TAKER_BUY_INTERVAL_MS,
+                force_balance_slack: FORCE_BALANCE_SLACK,
+                chase_only_in_excited: CHASE_ONLY_IN_EXCITED,
+            };
+            let (intents, effects) = decision::build_intents(
+                &fv,
+                &snap,
+                &thresholds,
+                now_ms,
+                self.last_taker_up_ts_ms,
+                self.last_taker_down_ts_ms,
+            );
+
+            // 步骤 E：写展示副作用 + 执行 IOC walk-the-book
+            if let Ok(mut s) = self.state.write() {
+                s.chase_side = effects.chase_side;
+                s.ledger.rebalance_hint_up = effects.rebalance_hint_up;
+                s.ledger.rebalance_hint_down = effects.rebalance_hint_down;
+                for intent in &intents {
+                    let out = execute_ioc_buy(
+                        &mut *s,
+                        intent.side,
+                        intent.qty,
+                        intent.worst,
+                        intent.reason,
+                        now_ms,
+                    );
+                    if out.filled_qty > 0.0 {
+                        match intent.side {
+                            ChaseSide::Up => self.last_taker_up_ts_ms = now_ms,
+                            ChaseSide::Down => self.last_taker_down_ts_ms = now_ms,
+                        }
+                    }
+                }
+            }
+            if let Some((win, row)) = excited_snap {
+                self.excited_snapshot_writer.push_snapshot(win, row);
+            }
+            self.last_was_steady = steady;
+        }
+    }
+
+    /// Binance L2 增量 → 本地 orderbook + AppState top10 档位
+    fn handle_depth(&mut self, data: crate::model::orderbook::DepthData) {
+        match self.orderbook.apply_depth_update(&data) {
+            Ok(_) if self.orderbook.is_ready() => {
+                if let Ok(mut s) = self.state.write() {
+                    s.bids = self
+                        .orderbook
+                        .top_bids(10)
+                        .into_iter()
+                        .map(|(p, q)| BookLevel { price: p, qty: q })
+                        .collect();
+                    s.asks = self
+                        .orderbook
+                        .top_asks(10)
+                        .into_iter()
+                        .map(|(p, q)| BookLevel { price: p, qty: q })
+                        .collect();
+                }
+            }
+            Err(e) if e.to_string() == "orderbookgap" => {
+                warn!("订单簿不连续，已重置");
+            }
+            _ => {}
+        }
+    }
+
+    /// Binance AggTrade → 喂滚动波动率 + 推 trade row 给 TUI
+    fn handle_agg_trade(&mut self, data: crate::model::trade::AggTradeData) {
+        if let Ok(trade) = Trade::try_from(&data) {
+            let is_buy = trade.is_taker_buy();
+            let dir = if is_buy { "▲" } else { "▼" };
+
+            // 更新滚动波动率（仅喂价与时间戳；年化 σ 在 BookTicker 中按到期 T 对齐计算）
+            self.vol_calc.update(trade.price, trade.trade_time_ms);
+
+            // 计算网络延迟 (ms) = 本机接收时间 - 交易所成交时间
+            let now_ms = (Local::now().timestamp_nanos_opt().unwrap_or(0) / 1_000_000) as u64;
+            let net_latency = now_ms.saturating_sub(trade.trade_time_ms);
+
+            let row = TradeRow {
+                dir_time: format!("{} {}", dir, Local::now().format("%H:%M:%S")),
+                is_buy,
+                price: trade.price,
+                qty: trade.quantity,
+                notional: trade.notional(),
+            };
+            if let Ok(mut s) = self.state.write() {
+                let s: &mut AppState = &mut *s;
+                s.push_trade(row);
+                // 更新延迟展示数据
+                s.latency.p50_ms = net_latency as f64; // 简化处理，直接显示当前值
+            }
+        }
+    }
+
+    /// Poly CLOB 更新 → 更新 offset / 跟上检查 / Merge 触发 / 快照落盘
+    fn handle_poly_book_update(&mut self) {
+        let mut excited_snap: Option<(i64, SnapshotRow)> = None;
+        let mut fv_snap_pending: Option<(i64, FvRow)> = None;
+        if let Ok(mut s) = self.state.write() {
+            // 与 BookTicker 一致：用 Up 中价（有 Up 用 Up，无则用 1 - Down）
+            let poly_mid = {
+                let up = s.poly_best_bid > 0.0 && s.poly_best_ask > 0.0;
+                let down = s.poly_down_best_bid > 0.0 && s.poly_down_best_ask > 0.0;
+                if up {
+                    (s.poly_best_bid + s.poly_best_ask) / 2.0
+                } else if down {
+                    1.0 - (s.poly_down_best_bid + s.poly_down_best_ask) / 2.0
+                } else {
+                    s.last_poly_mid
+                }
+            };
+            s.poly_btc_offset = poly_mid - s.mid_price;
+
+            // 近期 Poly 明显变动（保留约 5s，用于负延迟）
+            let five_sec = Duration::from_secs(5);
+            while s
+                .recent_poly_moves
+                .front()
+                .map(|(i, _)| i.elapsed() > five_sec)
+                .unwrap_or(false)
+            {
+                s.recent_poly_moves.pop_front();
+            }
+            if (poly_mid - s.last_poly_mid).abs() >= POLY_MOVE_THRESH && s.last_poly_mid > 0.0 {
+                s.recent_poly_moves.push_back((Instant::now(), poly_mid));
+            }
+            s.last_poly_mid = poly_mid;
+
+            // 进行中的 lead：检查跟上或超时
+            if let Some(lead) = s.excited_lead.as_ref() {
+                let elapsed_ms = lead.lead_start.elapsed().as_millis();
+                if elapsed_ms > LEAD_TIMEOUT_MS as u128 {
+                    s.excited_lead = None;
+                } else if (poly_mid - lead.fv_lead).abs() < CATCHUP_EPSILON {
+                    let delay_ms = lead.lead_start.elapsed().as_millis() as f64;
+                    s.delay_stats.record_pos_ms(delay_ms);
+                    s.excited_lead = None;
+                }
+            }
+
+            // 激变态快照（Poly 事件）：按 5 分钟窗口写 CSV
+            if s.market_state == "激变态" && s.poly_window_end_ts > 0 {
+                excited_snap = Some((
+                    s.poly_window_end_ts,
+                    SnapshotRow {
+                        t_ms: chrono::Utc::now().timestamp_millis(),
+                        fv_up: s.fair_price,
+                        fv_down: s.fair_price_down,
+                        poly_up_bid: s.poly_best_bid,
+                        poly_up_ask: s.poly_best_ask,
+                        poly_down_bid: s.poly_down_best_bid,
+                        poly_down_ask: s.poly_down_best_ask,
+                        source: b'P',
+                    },
+                ));
+            }
+
+            // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
+            let ts_ms = chrono::Utc::now().timestamp_millis();
+            let (up_bid, up_ask, down_bid, down_ask) = (
+                s.poly_best_bid,
+                s.poly_best_ask,
+                s.poly_down_best_bid,
+                s.poly_down_best_ask,
+            );
+            // v0.4.15 IOC：不再有 maker resting，PolyBookUpdate 不需要处理 pending fill。
+            let _ = (up_bid, up_ask, down_bid, down_ask);
+
+            // v0.4.0-5m：虚拟 merge 触发（替代旧浮亏 sell 减仓）
+            //   底层逻辑：1 UP + 1 DOWN ≡ 1 USDC（Polymarket CTF mergePositions 任意时刻可调）
+            //   触发条件：可配对张数 ≥ MERGE_TRIGGER_PAIR_QTY 且距上次 merge ≥ MERGE_INTERVAL_MS
+            //   v0.4.1 P0 守门 #3：avg_sum > 1 时拒绝 merge（避免主动锁亏，等结算 redeem 兜底）
+            //   v0.4.2 P1.2：窗口末段（expiry_min < FORCE_MERGE_EXPIRY_MIN）强制 merge：
+            //     - 每对 merge=$1.00 与 redeem 数学等价
+            //     - 即时锁定避免残仓过夜 gas + 清算时机风险
+            //     - 强制忽略 avg_sum<1 守门（窗口末段没机会等改善）
+            let mergeable = s.mergeable_pairs();
+            let merge_throttle_ok = ts_ms - s.ledger.last_merge_ts_ms >= MERGE_INTERVAL_MS;
+            let avg_sum_now = s.ledger.position_up.avg_price + s.ledger.position_down.avg_price;
+            let force_merge = s.expiry_minutes < FORCE_MERGE_EXPIRY_MIN;
+            let merge_avg_sum_ok = force_merge || avg_sum_now < MERGE_AVG_SUM_MAX;
+            if mergeable >= MERGE_TRIGGER_PAIR_QTY && merge_throttle_ok && merge_avg_sum_ok {
+                let pair_qty = mergeable.floor().max(MERGE_TRIGGER_PAIR_QTY);
+                s.apply_merge(pair_qty, ts_ms);
+            }
+            // 全量快照（v0.3.3）：每个 PolyBookUpdate 都落一行
+            if s.poly_window_end_ts > 0 {
+                let st_byte = if s.market_state == "稳态" {
+                    b'S'
+                } else {
+                    b'E'
+                };
+                fv_snap_pending = Some((
+                    s.poly_window_end_ts,
+                    FvRow {
+                        t_ms: chrono::Utc::now().timestamp_millis(),
+                        source: b'P',
+                        binance_mid: s.mid_price,
+                        fv_up: s.fair_price,
+                        fv_down: s.fair_price_down,
+                        poly_up_bid: s.poly_best_bid,
+                        poly_up_ask: s.poly_best_ask,
+                        poly_down_bid: s.poly_down_best_bid,
+                        poly_down_ask: s.poly_down_best_ask,
+                        sigma: s.volatility_annual,
+                        iv_raw: s.iv_poly,
+                        sigma_ema: self.fv_engine.sigma_ema(),
+                        market_state: st_byte,
+                        expiry_min: s.expiry_minutes,
+                        strike: s.strike_price,
+                    },
+                ));
+            }
+        }
+        if let Some((win, row)) = excited_snap {
+            self.excited_snapshot_writer.push_snapshot(win, row);
+        }
+        if let Some((win, row)) = fv_snap_pending {
+            self.fv_snapshot_writer.push(win, row);
         }
     }
 }

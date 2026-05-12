@@ -41,6 +41,10 @@ pub enum Mode {
 
 impl Cli {
     pub fn mode(&self) -> Mode {
-        if self.web { Mode::Web } else { Mode::Tui }
+        if self.web {
+            Mode::Web
+        } else {
+            Mode::Tui
+        }
     }
 }
