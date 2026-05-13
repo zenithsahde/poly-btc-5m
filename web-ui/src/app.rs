@@ -5,8 +5,8 @@ use shared_types::DashboardSnapshot;
 
 use crate::components::{
     fair_value::FairValuePanel, header::HeaderBar, order_log::OrderLogPanel,
-    orderbook::OrderbookPanel, poly_books::PolymarketPanel, price_chart::PriceChart,
-    trades::TradesPanel,
+    orderbook::OrderbookPanel, poly_books::PolymarketPanel, position::PositionPanel,
+    price_chart::PriceChart, trades::TradesPanel,
 };
 use crate::sse;
 
@@ -52,6 +52,7 @@ pub fn App() -> impl IntoView {
                     <section class="dash-poly"><PolymarketPanel /></section>
                     <section class="dash-trades"><TradesPanel /></section>
                     <section class="dash-fair"><FairValuePanel /></section>
+                    <section class="dash-position"><PositionPanel /></section>
                     <section class="dash-orders"><OrderLogPanel /></section>
                 </div>
             </main>

@@ -213,7 +213,8 @@ body { background: #0a0a0a; }
 .dash-poly { grid-column: 9 / span 4; grid-row: 1 / span 3; }
 .dash-trades { grid-column: 1 / span 4; grid-row: 2 / span 2; }
 .dash-fair { grid-column: 5 / span 4; grid-row: 2 / span 2; }
-.dash-orders { grid-column: 1 / span 8; grid-row: 4; }
+.dash-position { grid-column: 1 / span 8; grid-row: 4; }
+.dash-orders { grid-column: 1 / span 8; grid-row: 5; }
 .dash-poly > .card { min-height: 100%; }
 
 /* 卡片基础（避免在每个组件重复） */
@@ -239,6 +240,71 @@ body { background: #0a0a0a; }
 .kv { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; padding: 3px 0; font-size: 13px; line-height: 1.5; }
 .kv-key { color: #a1a1aa; flex: 0 0 auto; }
 .kv-val { color: #e4e4e7; font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; min-width: 0; text-align: right; overflow-wrap: anywhere; }
+
+/* ── Position / capital ledger ─────────────────────────── */
+.position-card {
+  display: grid;
+  gap: 14px;
+}
+.position-hero {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.8fr) repeat(3, minmax(120px, 1fr));
+  gap: 10px;
+}
+.money-tile {
+  min-width: 0;
+  border: 1px solid #24242a;
+  border-radius: 8px;
+  background: #0f0f12;
+  padding: 10px 12px;
+}
+.money-label {
+  color: #71717a;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.money-value {
+  margin-top: 5px;
+  color: #e4e4e7;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 17px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.money-note {
+  margin-top: 4px;
+  color: #71717a;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.position-section-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.position-subpanel {
+  min-width: 0;
+  border-top: 1px solid #1f1f23;
+  padding-top: 10px;
+}
+.position-subtitle {
+  color: #71717a;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
 
 /* ── Order Log ──────────────────────────────────────── */
 .order-log-card {
@@ -326,10 +392,13 @@ body { background: #0a0a0a; }
   .dashboard-grid { grid-template-columns: 1fr; }
   .dash-orderbook,
   .dash-chart,
-  .dash-poly,
-  .dash-trades,
-  .dash-fair,
-  .dash-orders { grid-column: auto; grid-row: auto; }
+	  .dash-poly,
+	  .dash-trades,
+	  .dash-fair,
+	  .dash-position,
+	  .dash-orders { grid-column: auto; grid-row: auto; }
+  .position-hero,
+  .position-section-grid { grid-template-columns: 1fr; }
 }
 /* Mid-width: PnL strip wraps chart under NET PNL to avoid cramping meta columns */
 @media (min-width: 1101px) and (max-width: 1500px) {
