@@ -27,10 +27,10 @@ impl ExecutionSim {
             submit_latency_ms,
             cancel_latency_ms,
             maker_timeout_ms,
-            // Conservative queue proxy: one qualifying touch consumes roughly half a 100-share clip
-            // ahead of us. This avoids instant maker fills while still allowing repeated pressure
-            // through our price to fill the order.
-            queue_touch_qty: 50.0,
+            // Realistic-conservative queue proxy: one qualifying touch consumes roughly one
+            // strategy clip ahead of us. It still prevents instant maker fills, but avoids
+            // making thin 5m books effectively unfillable.
+            queue_touch_qty: 100.0,
         }
     }
 

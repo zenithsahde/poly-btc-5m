@@ -90,6 +90,13 @@ const SAFETY_MARGIN: f64 = 0.05;
 const REBALANCE_MARGIN: f64 = 0.02;
 /// Origin-compatible fill mode：挂单超过此时间未 fill → cancel。
 const MAKER_TIMEOUT_MS: i64 = 5000;
+/// Dry-run submit latency: Tokyo → Cloudflare Tokyo PoP → London CLOB backend → ack.
+/// 实测 POST /order roundtrip P50=35ms（空body）；真实下单含签名校验+撮合 P50≈45ms, P95≈60ms。
+/// 取 P50 值 — 模拟多数情况；极端尾部延迟由 queue_touch_qty 间接吸收。
+const SIM_SUBMIT_LATENCY_MS: i64 = 45;
+/// Dry-run cancel latency: 实测 DELETE /order roundtrip 31-34ms + 处理 ≈ 40ms。
+/// 取略高于 P50 — cancel 期间 fill 竞争窗口越短越真实，不需要过度保守。
+const SIM_CANCEL_LATENCY_MS: i64 = 45;
 /// v0.4.15 IOC walk-the-book：chase 腿允许吃簿到 target + 此滑点（cent）。
 /// 上限来自 CHASE_GAP_MIN(10c) - SAFETY_MARGIN(5c) = 5c 容差，砍一半给未来反弹空间。
 const CHASE_WORST_SLIPPAGE: f64 = 0.03;
@@ -158,7 +165,11 @@ impl SignalEngine {
             fv_snapshot_writer: FvSnapshotWriter::new(),
             last_taker_up_ts_ms: 0,
             last_taker_down_ts_ms: 0,
-            execution_sim: ExecutionSim::new(60, CANCEL_DELAY_MS, MAKER_TIMEOUT_MS),
+            execution_sim: ExecutionSim::new(
+                SIM_SUBMIT_LATENCY_MS,
+                SIM_CANCEL_LATENCY_MS,
+                MAKER_TIMEOUT_MS,
+            ),
         }
     }
 

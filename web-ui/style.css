@@ -240,6 +240,82 @@ body { background: #0a0a0a; }
 .kv-key { color: #a1a1aa; flex: 0 0 auto; }
 .kv-val { color: #e4e4e7; font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; min-width: 0; text-align: right; overflow-wrap: anywhere; }
 
+/* ── Order Log ──────────────────────────────────────── */
+.order-log-card {
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+.order-log-header, .order-log-row {
+  display: grid;
+  grid-template-columns: 100px 60px 52px 48px minmax(0, 1fr) 56px 60px 80px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px;
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+.order-log-header {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #71717a;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #1f1f23;
+  flex: 0 0 auto;
+}
+.order-log-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+.order-log-row {
+  font-size: 12px;
+  line-height: 1.4;
+  padding-top: 5px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid rgba(31,31,35,0.5);
+}
+.order-log-row:hover {
+  background: rgba(39,39,42,0.25);
+}
+.order-log-empty {
+  color: #71717a;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 16px 0;
+  text-align: center;
+}
+.ol-col-time { color: #71717a; font-size: 11px; white-space: nowrap; }
+.ol-col-liq { color: #a1a1aa; font-size: 10px; font-weight: 700; }
+.ol-col-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #d4d4d8;
+}
+.ol-col-qty { color: #e4e4e7; text-align: right; }
+.ol-col-price { color: #e4e4e7; text-align: right; }
+.ol-col-pnl { text-align: right; white-space: nowrap; color: #a1a1aa; }
+.ol-kind {
+  border: 1px solid #3f3f46;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 800;
+  text-align: center;
+  color: #a1a1aa;
+}
+.ol-kind-fill { color: #22c55e; border-color: rgba(34,197,94,0.45); background: rgba(34,197,94,0.08); }
+.ol-kind-post { color: #60a5fa; border-color: rgba(96,165,250,0.45); background: rgba(96,165,250,0.08); }
+.ol-kind-cancel { color: #f59e0b; border-color: rgba(245,158,11,0.45); background: rgba(245,158,11,0.08); }
+.ol-kind-reject { color: #ef4444; border-color: rgba(239,68,68,0.45); background: rgba(239,68,68,0.08); }
+.ol-side { font-size: 11px; font-weight: 700; color: #a1a1aa; }
+.ol-side-up { color: #22c55e; }
+.ol-side-down { color: #60a5fa; }
+
 @media (max-width: 1100px) {
   .topbar-main, .topbar-detail { grid-template-columns: 1fr; align-items: stretch; }
   .brand-block, .top-stats { justify-content: space-between; }
@@ -252,7 +328,8 @@ body { background: #0a0a0a; }
   .dash-chart,
   .dash-poly,
   .dash-trades,
-  .dash-fair { grid-column: auto; grid-row: auto; }
+  .dash-fair,
+  .dash-orders { grid-column: auto; grid-row: auto; }
 }
 /* Mid-width: PnL strip wraps chart under NET PNL to avoid cramping meta columns */
 @media (min-width: 1101px) and (max-width: 1500px) {
