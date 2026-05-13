@@ -12,6 +12,7 @@ use crate::{
     config::AppConfig,
     execution::sim::ExecutionSim,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
+    position::PendingOrderReason,
     strategy::{
         decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -103,8 +104,8 @@ const REPRICE_TICK_THRESH: f64 = 0.02;
 /// 距窗口结束 < 此分钟数时停止新建 chase 仓。
 /// v0.4.15: 0.5 → 1.5，避免末段建仓导致单边卡死。
 const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 1.5;
-/// 距窗口结束 < 此分钟数时配平腿仍允许，拯救已建仓偏仓。
-const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.5;
+/// 配平腿允许一直尝试到窗口结束，用来拯救已建偏仓；只停止新 chase。
+const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.0;
 /// Poly WS 数据新鲜度守门：距上次 poly 事件超过此毫秒则禁止建仓。
 /// 1500ms 来自 lead P95=2.4s；Poly 静默超 1.5s 说明 WS 中断或 token 未订阅，
 /// 基于陈旧 best 价走簿会打穿 worst_price 拿到错误 fill。
@@ -116,6 +117,8 @@ const MERGE_AVG_SUM_MAX: f64 = 1.0;
 /// 全量 merge 已配对部分。底层逻辑：每对 merge=$1.00，与 redeem 数学等价；
 /// 但 merge 即时锁定，避免残仓过夜的链上 gas + 时机风险。
 const FORCE_MERGE_EXPIRY_MIN: f64 = 1.0;
+/// 窗口末段强制补齐偏仓：不再等 maker 好价，按缺口数量直接 taker market 配平。
+const FORCE_TAKER_REBAL_EXPIRY_MIN: f64 = 0.25;
 
 /// IV EMA 平滑系数 α。每帧反解出的 IV 加权 α，旧值加权 (1-α)。
 /// α=0.02 ≈ 时间常数 50 帧 ≈ 5s @ 100ms/tick。让 σ 反映市场共识但不被 Binance 瞬时跳动吸收。
@@ -427,6 +430,7 @@ impl SignalEngine {
                     &mut s,
                     (fair_p - SAFETY_MARGIN).max(0.0),
                     (fair_down - SAFETY_MARGIN).max(0.0),
+                    expiry_min <= FORCE_TAKER_REBAL_EXPIRY_MIN,
                     now_ms,
                 );
                 if fills.up {
@@ -495,6 +499,7 @@ impl SignalEngine {
                 min_order_qty: MIN_ORDER_QTY,
                 min_expiry_min_for_chase: MIN_EXPIRY_MIN_FOR_CHASE,
                 min_expiry_min_for_rebal: MIN_EXPIRY_MIN_FOR_REBAL,
+                force_taker_rebal_expiry_min: FORCE_TAKER_REBAL_EXPIRY_MIN,
                 taker_buy_interval_ms: TAKER_BUY_INTERVAL_MS,
                 force_balance_slack: FORCE_BALANCE_SLACK,
                 chase_only_in_excited: CHASE_ONLY_IN_EXCITED,
@@ -645,11 +650,38 @@ impl SignalEngine {
 
             // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
             let ts_ms = chrono::Utc::now().timestamp_millis();
-            let target_up = (s.fair_price - SAFETY_MARGIN).max(0.0);
-            let target_down = (s.fair_price_down - SAFETY_MARGIN).max(0.0);
-            let fills = self
-                .execution_sim
-                .process(&mut s, target_up, target_down, ts_ms);
+            let target_up = if s
+                .ledger
+                .maker_buy_intent_up
+                .as_ref()
+                .map(|o| o.reason == PendingOrderReason::Rebalance)
+                .unwrap_or(false)
+                && s.ledger.position_down.avg_price > 0.0
+            {
+                (1.0 - s.ledger.position_down.avg_price - REBALANCE_MARGIN).max(0.0)
+            } else {
+                (s.fair_price - SAFETY_MARGIN).max(0.0)
+            };
+            let target_down = if s
+                .ledger
+                .maker_buy_intent_down
+                .as_ref()
+                .map(|o| o.reason == PendingOrderReason::Rebalance)
+                .unwrap_or(false)
+                && s.ledger.position_up.avg_price > 0.0
+            {
+                (1.0 - s.ledger.position_up.avg_price - REBALANCE_MARGIN).max(0.0)
+            } else {
+                (s.fair_price_down - SAFETY_MARGIN).max(0.0)
+            };
+            let force_rebalance_taker = s.expiry_minutes <= FORCE_TAKER_REBAL_EXPIRY_MIN;
+            let fills = self.execution_sim.process(
+                &mut s,
+                target_up,
+                target_down,
+                force_rebalance_taker,
+                ts_ms,
+            );
             if fills.up {
                 self.last_taker_up_ts_ms = ts_ms;
             }
