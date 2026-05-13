@@ -88,6 +88,7 @@ pub struct ManagedOrder {
     pub order_hash: Option<String>,
     pub side: PositionSide,
     pub buy_sell: bool,
+    pub maker_taker: bool, // true=maker, false=taker
     /// 策略目标价（chase = FV - safety，rebal = 同侧 target），用于和 worst_price 对比评估滑点预算。
     pub target_price: f64,
     /// IOC 硬上限价（chase = target+slippage, rebal = (1-opp.avg)-headroom）。
@@ -100,6 +101,8 @@ pub struct ManagedOrder {
     pub fill_levels: u32,
     pub placed_ts_ms: i64,
     pub updated_ts_ms: i64,
+    pub exchange_arrive_ts_ms: i64,
+    pub queue_ahead_qty: f64,
     pub reason: PendingOrderReason,
     pub status: OrderStatus,
     pub reject_reason: Option<String>,
@@ -120,6 +123,7 @@ impl ManagedOrder {
             order_hash: None,
             side,
             buy_sell: true,
+            maker_taker: true,
             target_price: price,
             price,
             qty,
@@ -128,6 +132,8 @@ impl ManagedOrder {
             fill_levels: 0,
             placed_ts_ms,
             updated_ts_ms: placed_ts_ms,
+            exchange_arrive_ts_ms: placed_ts_ms,
+            queue_ahead_qty: 0.0,
             reason,
             status: OrderStatus::Created,
             reject_reason: None,

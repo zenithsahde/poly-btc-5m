@@ -8,12 +8,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::tui::app::AppState;
 
+mod db;
 mod routes;
 mod snapshot;
 mod sse;
@@ -37,6 +39,7 @@ pub async fn serve(
         );
     }
 
+    spawn_web_pnl_sampler(Arc::clone(&app_state));
     let state = WebState { app_state };
     let app = routes::router(state, dist_path);
 
@@ -54,4 +57,25 @@ pub async fn serve(
         .await
         .context("axum::serve 失败")?;
     Ok(())
+}
+
+fn spawn_web_pnl_sampler(app_state: Arc<RwLock<AppState>>) {
+    tokio::spawn(async move {
+        loop {
+            let persist_result = match app_state.write() {
+                Ok(mut s) => s
+                    .record_web_pnl_sample()
+                    .map(|point| db::persist_sample(&s, &point)),
+                Err(p) => {
+                    let mut s = p.into_inner();
+                    s.record_web_pnl_sample()
+                        .map(|point| db::persist_sample(&s, &point))
+                }
+            };
+            if let Some(Err(err)) = persist_result {
+                warn!("Web UI SQLite persistence failed: {err:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
 }

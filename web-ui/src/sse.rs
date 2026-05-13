@@ -11,12 +11,12 @@ pub fn connect(target: RwSignal<Option<DashboardSnapshot>>) -> SseHandle {
     let es = EventSource::new("/api/stream").expect("无法创建 EventSource('/api/stream')");
 
     let on_message: Closure<dyn FnMut(MessageEvent)> = Closure::new(move |evt: MessageEvent| {
-        let Some(data_js) = evt.data().as_string() else { return };
+        let Some(data_js) = evt.data().as_string() else {
+            return;
+        };
         match serde_json::from_str::<DashboardSnapshot>(&data_js) {
             Ok(snap) => target.set(Some(snap)),
-            Err(e) => web_sys::console::warn_1(
-                &format!("SSE 解码失败: {e}").into(),
-            ),
+            Err(e) => web_sys::console::warn_1(&format!("SSE 解码失败: {e}").into()),
         }
     });
 

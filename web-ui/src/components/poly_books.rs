@@ -8,15 +8,33 @@ use crate::format::{fmt_price, fmt_qty};
 pub fn PolymarketPanel() -> impl IntoView {
     let SnapshotSignal(snapshot) = use_context().expect("SnapshotSignal");
 
-    let slug = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.poly.slug.clone()).unwrap_or_default()));
-    let expiry = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| format!("{:.2}", s.poly.expiry_minutes)).unwrap_or_else(|| "—".into())));
-    let delay_text = Signal::derive(move || {
-        snapshot.with(|s| s.as_ref().and_then(|s| s.poly.poly_delay_ms).map(|d| format!("{}ms", d)).unwrap_or_default())
+    let slug = Signal::derive(move || {
+        snapshot.with(|s| s.as_ref().map(|s| s.poly.slug.clone()).unwrap_or_default())
     });
-    let has_delay = move || snapshot.with(|s| s.as_ref().and_then(|s| s.poly.poly_delay_ms).is_some());
+    let expiry = Signal::derive(move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| format!("{:.2}", s.poly.expiry_minutes))
+                .unwrap_or_else(|| "—".into())
+        })
+    });
+    let delay_text = Signal::derive(move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .and_then(|s| s.poly.poly_delay_ms)
+                .map(|d| format!("{}ms", d))
+                .unwrap_or_default()
+        })
+    });
+    let has_delay =
+        move || snapshot.with(|s| s.as_ref().and_then(|s| s.poly.poly_delay_ms).is_some());
 
-    let up = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.poly.up.clone()).unwrap_or_default()));
-    let down = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.poly.down.clone()).unwrap_or_default()));
+    let up = Signal::derive(move || {
+        snapshot.with(|s| s.as_ref().map(|s| s.poly.up.clone()).unwrap_or_default())
+    });
+    let down = Signal::derive(move || {
+        snapshot.with(|s| s.as_ref().map(|s| s.poly.down.clone()).unwrap_or_default())
+    });
 
     view! {
         <div class="card">
@@ -78,7 +96,11 @@ fn SideBook(title: &'static str, book: Signal<PolyBook>) -> impl IntoView {
 
 #[component]
 fn Levels(levels: Signal<Vec<Level>>, buy: bool) -> impl IntoView {
-    let cls = if buy { "flex justify-between cell-bid" } else { "flex justify-between cell-ask" };
+    let cls = if buy {
+        "flex justify-between cell-bid"
+    } else {
+        "flex justify-between cell-ask"
+    };
     view! {
         <div>
             <For

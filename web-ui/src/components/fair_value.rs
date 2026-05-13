@@ -7,17 +7,82 @@ use crate::format::{fmt_pct_bps, fmt_price};
 pub fn FairValuePanel() -> impl IntoView {
     let SnapshotSignal(snapshot) = use_context().expect("SnapshotSignal");
 
-    let fair = Signal::derive(move || format!("{:.4}", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.fair_price).unwrap_or(0.0))));
-    let fair_down = Signal::derive(move || format!("{:.4}", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.fair_price_down).unwrap_or(0.0))));
-    let vol = Signal::derive(move || format!("{:.3}", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.volatility_annual).unwrap_or(0.0))));
-    let sigma_src = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.fair_value.sigma_source.clone()).unwrap_or_default()));
-    let state = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.fair_value.market_state.clone()).unwrap_or_else(|| "—".into())));
-    let gap = Signal::derive(move || fmt_pct_bps(snapshot.with(|s| s.as_ref().map(|s| s.fair_value.signal_gap_bps).unwrap_or(0.0))));
-    let snipe = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.fair_value.last_snipe_info.clone()).unwrap_or_default()));
-    let snipes = Signal::derive(move || format!("{}", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.snipe_count).unwrap_or(0))));
-    let strike = Signal::derive(move || fmt_price(snapshot.with(|s| s.as_ref().map(|s| s.fair_value.strike_price).unwrap_or(0.0))));
-    let expiry = Signal::derive(move || format!("{:.2} min", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.expiry_minutes).unwrap_or(0.0))));
-    let iv_poly = Signal::derive(move || format!("{:.3}", snapshot.with(|s| s.as_ref().map(|s| s.fair_value.iv_poly).unwrap_or(0.0))));
+    let fair = Signal::derive(move || {
+        format!(
+            "{:.4}",
+            snapshot.with(|s| s.as_ref().map(|s| s.fair_value.fair_price).unwrap_or(0.0))
+        )
+    });
+    let fair_down = Signal::derive(move || {
+        format!(
+            "{:.4}",
+            snapshot.with(|s| s
+                .as_ref()
+                .map(|s| s.fair_value.fair_price_down)
+                .unwrap_or(0.0))
+        )
+    });
+    let vol = Signal::derive(move || {
+        format!(
+            "{:.3}",
+            snapshot.with(|s| s
+                .as_ref()
+                .map(|s| s.fair_value.volatility_annual)
+                .unwrap_or(0.0))
+        )
+    });
+    let sigma_src = Signal::derive(move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.fair_value.sigma_source.clone())
+                .unwrap_or_default()
+        })
+    });
+    let state = Signal::derive(move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.fair_value.market_state.clone())
+                .unwrap_or_else(|| "—".into())
+        })
+    });
+    let gap = Signal::derive(move || {
+        fmt_pct_bps(snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.fair_value.signal_gap_bps)
+                .unwrap_or(0.0)
+        }))
+    });
+    let snipe = Signal::derive(move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.fair_value.last_snipe_info.clone())
+                .unwrap_or_default()
+        })
+    });
+    let snipes = Signal::derive(move || {
+        format!(
+            "{}",
+            snapshot.with(|s| s.as_ref().map(|s| s.fair_value.snipe_count).unwrap_or(0))
+        )
+    });
+    let strike = Signal::derive(move || {
+        fmt_price(snapshot.with(|s| s.as_ref().map(|s| s.fair_value.strike_price).unwrap_or(0.0)))
+    });
+    let expiry = Signal::derive(move || {
+        format!(
+            "{:.2} min",
+            snapshot.with(|s| s
+                .as_ref()
+                .map(|s| s.fair_value.expiry_minutes)
+                .unwrap_or(0.0))
+        )
+    });
+    let iv_poly = Signal::derive(move || {
+        format!(
+            "{:.3}",
+            snapshot.with(|s| s.as_ref().map(|s| s.fair_value.iv_poly).unwrap_or(0.0))
+        )
+    });
 
     view! {
         <div class="card">

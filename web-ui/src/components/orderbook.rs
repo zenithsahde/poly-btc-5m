@@ -9,9 +9,22 @@ pub fn OrderbookPanel() -> impl IntoView {
     let SnapshotSignal(snapshot) = use_context().expect("SnapshotSignal");
 
     let mid = move || snapshot.with(|s| s.as_ref().map(|s| s.orderbook.mid_price).unwrap_or(0.0));
-    let spread = move || snapshot.with(|s| s.as_ref().map(|s| s.orderbook.spread_bps).unwrap_or(0.0));
-    let bids = move || snapshot.with(|s| s.as_ref().map(|s| s.orderbook.bids.clone()).unwrap_or_default());
-    let asks = move || snapshot.with(|s| s.as_ref().map(|s| s.orderbook.asks.clone()).unwrap_or_default());
+    let spread =
+        move || snapshot.with(|s| s.as_ref().map(|s| s.orderbook.spread_bps).unwrap_or(0.0));
+    let bids = move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.orderbook.bids.clone())
+                .unwrap_or_default()
+        })
+    };
+    let asks = move || {
+        snapshot.with(|s| {
+            s.as_ref()
+                .map(|s| s.orderbook.asks.clone())
+                .unwrap_or_default()
+        })
+    };
 
     view! {
         <div class="card">

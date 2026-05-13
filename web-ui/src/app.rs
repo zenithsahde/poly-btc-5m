@@ -4,9 +4,9 @@ use leptos::prelude::*;
 use shared_types::DashboardSnapshot;
 
 use crate::components::{
-    fair_value::FairValuePanel, header::HeaderBar, latency::LatencyPanel,
-    orderbook::OrderbookPanel, poly_books::PolymarketPanel, position::PositionPanel,
-    price_chart::PriceChart, trades::TradesPanel,
+    fair_value::FairValuePanel, header::HeaderBar, order_log::OrderLogPanel,
+    orderbook::OrderbookPanel, poly_books::PolymarketPanel, price_chart::PriceChart,
+    trades::TradesPanel,
 };
 use crate::sse;
 
@@ -45,25 +45,15 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="min-h-screen flex flex-col">
             <HeaderBar />
-            <main class="flex-1 px-6 py-4 grid grid-cols-12 gap-4">
-                // Left column: Binance L2 + 成交 + 延迟
-                <section class="col-span-4 flex flex-col gap-4">
-                    <OrderbookPanel />
-                    <TradesPanel />
-                    <LatencyPanel />
-                </section>
-
-                // Center column: 价格图 + 公允价/市场状态 + 仓位
-                <section class="col-span-4 flex flex-col gap-4">
-                    <PriceChart />
-                    <FairValuePanel />
-                    <PositionPanel />
-                </section>
-
-                // Right column: Polymarket UP / DOWN
-                <section class="col-span-4 flex flex-col gap-4">
-                    <PolymarketPanel />
-                </section>
+            <main class="dashboard-main">
+                <div class="dashboard-grid">
+                    <section class="dash-orderbook"><OrderbookPanel /></section>
+                    <section class="dash-chart"><PriceChart /></section>
+                    <section class="dash-poly"><PolymarketPanel /></section>
+                    <section class="dash-trades"><TradesPanel /></section>
+                    <section class="dash-fair"><FairValuePanel /></section>
+                    <section class="dash-orders"><OrderLogPanel /></section>
+                </div>
             </main>
             <footer class="px-6 py-3 text-xs text-zinc-500 border-t border-border">
                 "rust_engine · live via SSE @ /api/stream"

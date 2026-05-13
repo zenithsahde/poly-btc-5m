@@ -57,6 +57,14 @@ pub struct DelayStats {
     pub max_neg_ms: f64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WebPnlPoint {
+    pub uptime_secs: u64,
+    pub net_pnl: f64,
+    pub cash_pnl: f64,
+    pub inventory_value: f64,
+}
+
 impl DelayStats {
     pub fn record_pos_ms(&mut self, delay_ms: f64) {
         self.count_pos = self.count_pos.saturating_add(1);
@@ -187,6 +195,9 @@ pub struct AppState {
     pub ledger: PositionLedger,
     /// 当前可追涨侧（用于展示与浮亏减仓；UP 优先，若 UP 满足则显 UP）
     pub chase_side: Option<ChaseSide>,
+    /// Web UI PnL 曲线采样。30s 一个点，保留 2 天，用于浏览器晚连接后仍能看到历史走势。
+    pub web_pnl_history: VecDeque<WebPnlPoint>,
+    pub last_web_pnl_sample_secs: Option<u64>,
 }
 
 impl AppState {
@@ -246,6 +257,8 @@ impl AppState {
             recent_poly_moves: VecDeque::with_capacity(200), // ~5s at 40/s
             ledger: PositionLedger::default(),
             chase_side: None,
+            web_pnl_history: VecDeque::with_capacity(5760),
+            last_web_pnl_sample_secs: None,
         }
     }
 
@@ -261,6 +274,32 @@ impl AppState {
             self.recent_trades.pop_back();
         }
         self.recent_trades.push_front(row);
+    }
+
+    pub fn record_web_pnl_sample(&mut self) -> Option<WebPnlPoint> {
+        const SAMPLE_SECS: u64 = 30;
+        const KEEP_POINTS: usize = 5760; // 2 days at 30s cadence
+
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        if let Some(last) = self.last_web_pnl_sample_secs {
+            if uptime_secs.saturating_sub(last) < SAMPLE_SECS {
+                return None;
+            }
+        }
+
+        let point = WebPnlPoint {
+            uptime_secs,
+            net_pnl: self.net_pnl(),
+            cash_pnl: self.cash_pnl(),
+            inventory_value: self.inventory_value(),
+        };
+        self.web_pnl_history.push_back(point.clone());
+        self.last_web_pnl_sample_secs = Some(uptime_secs);
+
+        while self.web_pnl_history.len() > KEEP_POINTS {
+            self.web_pnl_history.pop_front();
+        }
+        Some(point)
     }
 
     /// 更新消息速率（每秒调用一次）

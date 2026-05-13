@@ -14,7 +14,9 @@ pub fn PriceChart() -> impl IntoView {
     let SnapshotSignal(snapshot) = use_context().expect("SnapshotSignal");
     let PriceHistory(history) = use_context().expect("PriceHistory");
 
-    let mid_now = Signal::derive(move || fmt_price(snapshot.with(|s| s.as_ref().map(|s| s.orderbook.mid_price).unwrap_or(0.0))));
+    let mid_now = Signal::derive(move || {
+        fmt_price(snapshot.with(|s| s.as_ref().map(|s| s.orderbook.mid_price).unwrap_or(0.0)))
+    });
 
     let path_d = Signal::derive(move || {
         let pts = history.get();
@@ -44,11 +46,17 @@ pub fn PriceChart() -> impl IntoView {
 
     let range_text = Signal::derive(move || {
         let pts = history.get();
-        if pts.is_empty() { return String::new(); }
+        if pts.is_empty() {
+            return String::new();
+        }
         let ys: Vec<f64> = pts.iter().map(|(_, p)| *p).collect();
         let lo = ys.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        if lo > 0.0 { format!("range {:.0} – {:.0}", lo, hi) } else { String::new() }
+        if lo > 0.0 {
+            format!("range {:.0} – {:.0}", lo, hi)
+        } else {
+            String::new()
+        }
     });
 
     view! {

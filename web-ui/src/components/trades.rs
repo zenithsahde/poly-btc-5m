@@ -7,7 +7,8 @@ use crate::format::{fmt_price, fmt_qty};
 #[component]
 pub fn TradesPanel() -> impl IntoView {
     let SnapshotSignal(snapshot) = use_context().expect("SnapshotSignal");
-    let trades = move || snapshot.with(|s| s.as_ref().map(|s| s.trades.clone()).unwrap_or_default());
+    let trades =
+        move || snapshot.with(|s| s.as_ref().map(|s| s.trades.clone()).unwrap_or_default());
 
     view! {
         <div class="card">

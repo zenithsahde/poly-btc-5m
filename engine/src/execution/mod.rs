@@ -5,3 +5,4 @@ pub mod ioc;
 pub mod order_manager;
 pub mod poly_api;
 pub mod signer;
+pub mod sim;

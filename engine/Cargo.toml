@@ -40,6 +40,7 @@ thiserror = "1"
 
 # 时间处理
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # futures-util (提供 SinkExt / StreamExt，tokio-tungstenite 依赖它但不 re-export)
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

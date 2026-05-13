@@ -49,6 +49,7 @@ pub fn execute_ioc_buy(
     let mut order: ManagedOrder =
         s.ledger
             .create_managed_buy_order(side, worst_price, want_qty, ts_ms, reason);
+    order.maker_taker = false;
     order.target_price = target_price;
 
     let mut remaining = want_qty;

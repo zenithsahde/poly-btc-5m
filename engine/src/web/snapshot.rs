@@ -7,7 +7,8 @@ use std::sync::{Arc, RwLock};
 
 use shared_types::{
     DashboardSnapshot, DelayStatsView, FairValueView, HeaderInfo, LatencyStats, Level,
-    OrderbookView, PolyBook, PolyView, PositionSide, PositionView, TradeRow,
+    OrderEventView, OrderbookView, PnlPointView, PolyBook, PolyView, PositionSide, PositionView,
+    TradeRow,
 };
 
 use crate::position::{
@@ -159,6 +160,27 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         ioc_last_order: ioc
             .last_order(&s.ledger.order_history)
             .map(ioc_order_summary),
+        last_action: latest_position_action(
+            &s.ledger.trades_current_window,
+            &s.ledger.order_history,
+        ),
+        pnl_history: s
+            .web_pnl_history
+            .iter()
+            .map(|p| PnlPointView {
+                uptime_secs: p.uptime_secs,
+                net_pnl: p.net_pnl,
+                cash_pnl: p.cash_pnl,
+                inventory_value: p.inventory_value,
+            })
+            .collect(),
+        order_events: order_events(
+            &s.ledger.trades_current_window,
+            &s.ledger.order_history,
+            s.ledger.maker_buy_intent_up.as_ref(),
+            s.ledger.maker_buy_intent_down.as_ref(),
+            s.net_pnl(),
+        ),
     };
 
     let fair_value = FairValueView {
@@ -393,5 +415,196 @@ fn ioc_order_summary(order: &ManagedOrder) -> String {
             "{} {}/{} 0/{:.0}张 worst={:.2}",
             side, status, reason, order.qty, order.price
         )
+    }
+}
+
+fn latest_position_action(trades: &[TradeRecord], orders: &[ManagedOrder]) -> Option<String> {
+    let last_trade = trades.iter().max_by_key(|t| t.ts_ms);
+    let last_order = orders.iter().max_by_key(|o| o.updated_ts_ms);
+    match (last_trade, last_order) {
+        (Some(t), Some(o)) if t.ts_ms >= o.updated_ts_ms => Some(trade_action_summary(t)),
+        (Some(_), Some(o)) => Some(order_action_summary(o)),
+        (Some(t), None) => Some(trade_action_summary(t)),
+        (None, Some(o)) => Some(order_action_summary(o)),
+        (None, None) => None,
+    }
+}
+
+fn trade_action_summary(trade: &TradeRecord) -> String {
+    let venue = if trade.maker_taker { "MAKER" } else { "TAKER" };
+    let side = match trade.side {
+        LedgerSide::Up => "UP",
+        LedgerSide::Down => "DOWN",
+    };
+    let direction = if trade.buy_sell { "BUY" } else { "SELL" };
+    format!(
+        "{} {} {} {:.0}@{:.2} cost={:.2}",
+        venue,
+        side,
+        direction,
+        trade.qty,
+        trade.price,
+        trade.qty * trade.price
+    )
+}
+
+fn order_action_summary(order: &ManagedOrder) -> String {
+    let side = match order.side {
+        LedgerSide::Up => "UP",
+        LedgerSide::Down => "DOWN",
+    };
+    let reason = match order.reason {
+        PendingOrderReason::Chase => "chase",
+        PendingOrderReason::Rebalance => "rebal",
+    };
+    let status = if order.filled_qty > 0.0 {
+        "FILL"
+    } else if order.reject_reason.as_deref() == Some("worst_breach") {
+        "REJECT"
+    } else {
+        match order.status {
+            OrderStatus::Cancelled => "CANCEL",
+            OrderStatus::Expired => "CANCEL",
+            OrderStatus::Rejected => "REJECT",
+            _ => "ORDER",
+        }
+    };
+    format!(
+        "{} {} {} {} {:.0}@{:.2}",
+        status,
+        liquidity_name(order.maker_taker),
+        side,
+        reason,
+        order.qty,
+        order.price
+    )
+}
+
+fn order_event_summary(order: &ManagedOrder) -> String {
+    format!(
+        "{} {} {:.0}@{:.2}",
+        side_name(order.side),
+        reason_name(order.reason),
+        if order.filled_qty > 0.0 {
+            order.filled_qty
+        } else {
+            order.qty
+        },
+        if order.filled_qty > 0.0 {
+            order.vwap()
+        } else {
+            order.price
+        }
+    )
+}
+
+fn order_events(
+    trades: &[TradeRecord],
+    orders: &[ManagedOrder],
+    pending_up: Option<&ManagedOrder>,
+    pending_down: Option<&ManagedOrder>,
+    current_pnl: f64,
+) -> Vec<OrderEventView> {
+    let mut events = Vec::new();
+
+    for order in [pending_up, pending_down].into_iter().flatten() {
+        events.push(OrderEventView {
+            ts_ms: order.placed_ts_ms,
+            kind: "POST".to_string(),
+            liquidity: liquidity_name(order.maker_taker).to_string(),
+            side: side_name(order.side).to_string(),
+            summary: format!(
+                "{} {} {:.0}@{:.2}",
+                side_name(order.side),
+                reason_name(order.reason),
+                order.remaining_qty(),
+                order.price
+            ),
+            qty: order.remaining_qty(),
+            price: order.price,
+            pnl: current_pnl,
+        });
+    }
+
+    for trade in trades {
+        let kind = if trade.maker_taker { "MAKER" } else { "TAKER" };
+        events.push(OrderEventView {
+            ts_ms: trade.ts_ms,
+            kind: "FILL".to_string(),
+            liquidity: kind.to_string(),
+            side: side_name(trade.side).to_string(),
+            summary: format!(
+                "{} {} {:.0}@{:.2}",
+                if trade.buy_sell { "BUY" } else { "SELL" },
+                side_name(trade.side),
+                trade.qty,
+                trade.price
+            ),
+            qty: trade.qty,
+            price: trade.price,
+            pnl: current_pnl,
+        });
+    }
+
+    for order in orders {
+        events.push(OrderEventView {
+            ts_ms: order.updated_ts_ms,
+            kind: order_event_kind(order).to_string(),
+            liquidity: liquidity_name(order.maker_taker).to_string(),
+            side: side_name(order.side).to_string(),
+            summary: order_event_summary(order),
+            qty: if order.filled_qty > 0.0 {
+                order.filled_qty
+            } else {
+                order.qty
+            },
+            price: if order.filled_qty > 0.0 {
+                order.vwap()
+            } else {
+                order.price
+            },
+            pnl: current_pnl,
+        });
+    }
+
+    events.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    events.truncate(40);
+    events
+}
+
+fn order_event_kind(order: &ManagedOrder) -> &'static str {
+    if order.filled_qty > 0.0 {
+        "MATCH"
+    } else if order.reject_reason.as_deref() == Some("worst_breach") {
+        "REJECT"
+    } else {
+        match order.status {
+            OrderStatus::Cancelled => "CANCEL",
+            OrderStatus::Expired => "CANCEL",
+            OrderStatus::Rejected => "REJECT",
+            _ => "ORDER",
+        }
+    }
+}
+
+fn side_name(side: LedgerSide) -> &'static str {
+    match side {
+        LedgerSide::Up => "UP",
+        LedgerSide::Down => "DOWN",
+    }
+}
+
+fn reason_name(reason: PendingOrderReason) -> &'static str {
+    match reason {
+        PendingOrderReason::Chase => "chase",
+        PendingOrderReason::Rebalance => "rebal",
+    }
+}
+
+fn liquidity_name(maker_taker: bool) -> &'static str {
+    if maker_taker {
+        "MAKER"
+    } else {
+        "TAKER"
     }
 }

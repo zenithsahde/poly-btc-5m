@@ -136,6 +136,30 @@ pub struct PositionView {
     pub ioc_rebal_filled: usize,
     pub ioc_rebal_fill_rate: f64,
     pub ioc_last_order: Option<String>,
+    pub last_action: Option<String>,
+    pub pnl_history: Vec<PnlPointView>,
+    pub order_events: Vec<OrderEventView>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PnlPointView {
+    pub uptime_secs: u64,
+    pub net_pnl: f64,
+    pub cash_pnl: f64,
+    pub inventory_value: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OrderEventView {
+    pub ts_ms: i64,
+    pub kind: String,
+    #[serde(default)]
+    pub liquidity: String,
+    pub side: String,
+    pub summary: String,
+    pub qty: f64,
+    pub price: f64,
+    pub pnl: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
