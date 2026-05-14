@@ -2,6 +2,7 @@ pub mod balance;
 pub mod client;
 pub mod gateway;
 pub mod ioc;
+pub mod merge;
 pub mod order_manager;
 pub mod signer;
 pub mod sim;

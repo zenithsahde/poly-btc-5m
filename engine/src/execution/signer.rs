@@ -120,6 +120,11 @@ impl PolySigner {
     }
 
     #[inline]
+    pub fn signature_mode(&self) -> SignatureMode {
+        self.mode
+    }
+
+    #[inline]
     pub fn signer_address(&self) -> Address {
         self.key.address()
     }
@@ -164,6 +169,22 @@ impl PolySigner {
             metadata: B256::ZERO,
             builder: self.builder_code,
         }
+    }
+
+    #[inline]
+    pub fn local_signer(&self) -> PrivateKeySigner {
+        self.key.clone()
+    }
+
+    // personal_sign(digest) + v+=4：Safe 1.3+ checkSignatures 的 eth_sign 分支
+    pub async fn sign_safe_personal(&self, digest: B256) -> Result<[u8; 65]> {
+        let sig = self.key.sign_message(digest.as_slice()).await?;
+        let bytes = sig.as_bytes();
+        let base_v = if bytes[64] < 27 { bytes[64] + 27 } else { bytes[64] };
+        let mut out = [0u8; 65];
+        out[..64].copy_from_slice(&bytes[..64]);
+        out[64] = base_v + 4;
+        Ok(out)
     }
 
     pub async fn sign_clob_auth(&self, timestamp_secs: u64, nonce: u64) -> Result<[u8; 65]> {

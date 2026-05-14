@@ -276,6 +276,7 @@ pub struct PositionLedger {
     pub cash_paid: f64,
     /// 上次 merge 时间戳（ms），用于节流
     pub last_merge_ts_ms: i64,
+    pub last_merge_tx_hash: Option<String>,
     /// 配平提示 UP：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_up: Option<(f64, f64)>,
     /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
@@ -613,11 +614,9 @@ impl PositionLedger {
         self.rebalance_hint_down = None;
     }
 
+    // merge 由调用方在写锁外异步完成，这里只处理胜出方赎回
     pub fn settle_window_and_redeem(&mut self, strike_price: f64, binance_close: f64, ts_ms: i64) {
-        let pairs = self.mergeable_pairs();
-        if pairs > 0.0 {
-            self.apply_merge(pairs, ts_ms);
-        }
+        let _ = ts_ms;
         if strike_price > 0.0 && binance_close > 0.0 {
             let up_wins = binance_close >= strike_price;
             if up_wins && self.position_up.qty > 0.0 {

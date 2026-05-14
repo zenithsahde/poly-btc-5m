@@ -11,10 +11,12 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 
+use crate::execution::client::OrderClient;
 use crate::tui::app::{AppState, BookLevel};
 use crate::ws::discovery::{Active5mMarket, MarketDiscovery};
 use crate::ws::reconnect::ReconnectPolicy;
 use crate::ws::stream::{MarketEvent, PolyBookData};
+use alloy_primitives::B256;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const PING_INTERVAL_SECS: u64 = 10;
@@ -37,6 +39,8 @@ struct PolyMarketState {
     down_token_id: String,
     slug: String,
     window_end_ts: i64,
+    /// 当前 5m 市场的 CTF conditionId，窗口结束时 merge 用。
+    condition_id: B256,
     next_market: Option<Active5mMarket>,
 }
 
@@ -46,6 +50,7 @@ pub struct PolyWsClient {
     state: Arc<std::sync::RwLock<AppState>>,
     rest_endpoint: String,
     symbol: String,
+    order_client: Arc<dyn OrderClient>,
 }
 
 impl PolyWsClient {
@@ -55,12 +60,14 @@ impl PolyWsClient {
         state: Arc<std::sync::RwLock<AppState>>,
         rest_endpoint: String,
         symbol: String,
+        order_client: Arc<dyn OrderClient>,
     ) -> Self {
         let market = Arc::new(RwLock::new(PolyMarketState {
             up_token_id: initial.up_token_id.clone(),
             down_token_id: initial.down_token_id.clone(),
             slug: initial.slug.clone(),
             window_end_ts: initial.window_end_ts,
+            condition_id: initial.condition_id,
             next_market: None,
         }));
         if let Ok(mut s) = state.write() {
@@ -75,6 +82,7 @@ impl PolyWsClient {
             state,
             rest_endpoint,
             symbol,
+            order_client,
         }
     }
 
@@ -273,6 +281,8 @@ impl PolyWsClient {
             }
         };
 
+        let old_condition_id = self.market.read().await.condition_id;
+
         // 只更新内存状态并清空订单簿，不在此连接上 unsubscribe/subscribe（服务端同连接换订往往不重推 book）
         {
             let mut m = self.market.write().await;
@@ -280,7 +290,31 @@ impl PolyWsClient {
             m.down_token_id = new_market.down_token_id.clone();
             m.slug = new_market.slug.clone();
             m.window_end_ts = new_market.window_end_ts;
+            m.condition_id = new_market.condition_id;
         }
+
+        // merge 在写锁之外 await，成功后再进锁 apply_merge；失败保留持仓由下个窗口重试
+        let pair_qty = self
+            .state
+            .read()
+            .ok()
+            .map(|s| s.ledger.mergeable_pairs())
+            .unwrap_or(0.0);
+        let merge_outcome = if pair_qty > 0.0 && old_condition_id != B256::ZERO {
+            match self.order_client.merge_pairs(old_condition_id, pair_qty).await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    warn!(pair_qty, error = %e, "窗口收盘 merge 失败");
+                    None
+                }
+            }
+        } else {
+            if pair_qty > 0.0 && old_condition_id == B256::ZERO {
+                warn!(pair_qty, "旧窗口 conditionId 缺失，跳过 merge");
+            }
+            None
+        };
+
         // 行权价 K：优先用币安在「窗口开始这一秒」内的首笔成交价（秒级），无成交则 1m 开盘价，失败则用当前 mid
         let window_start_ts = new_market.window_end_ts - 300;
         let strike_from_binance = crate::ws::binance_rest::get_spot_price_at_time(
@@ -296,10 +330,21 @@ impl PolyWsClient {
                     tracing::warn!("保存窗口 {} 成交记录失败: {:?}", old_window_ts, e);
                 }
             }
-            // v0.4.3-5m: 窗口切换前先 settle —— force-merge 可配对 + redeem 单边赢家
-            //   binance_close 用 last mid 作 BTC 收盘价代理（与 Chainlink 有 ~10$ basis 误差）
-            //   这样残仓的真实结算结果会进入 cash_received，不再被 reset 吞掉
             let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Some(outcome) = merge_outcome {
+                s.ledger.apply_merge(outcome.pair_qty, now_ms);
+                if outcome.tx_hash != B256::ZERO {
+                    s.ledger.last_merge_tx_hash =
+                        Some(format!("0x{}", hex::encode(outcome.tx_hash.as_slice())));
+                    info!(
+                        tx_hash = %outcome.tx_hash,
+                        pair_qty = outcome.pair_qty,
+                        elapsed_ms = outcome.elapsed_ms,
+                        "窗口收盘 merge 已上链"
+                    );
+                }
+            }
+            // binance_close 用 last mid 作 BTC 收盘价代理（与 Chainlink 有 ~10$ basis）
             let binance_close = s.mid_price;
             s.settle_window_and_redeem(binance_close, now_ms);
             s.reset_inventory_for_new_window();
