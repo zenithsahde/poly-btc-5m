@@ -159,8 +159,10 @@ pub struct AppState {
     pub snipe_threshold_bps: f64,
     /// 当前监控的 Polymarket Slug
     pub poly_market_slug: String,
-    /// 当前 Poly Token ID（切换市场时更新，供下单使用）
+    /// 当前 Poly Token ID（UP 侧；切换市场时更新，供下单使用）
     pub poly_token_id: String,
+    /// 当前 Poly Token ID（DOWN 侧；切换市场时更新，实盘下单 DOWN 用）
+    pub poly_down_token_id: String,
     /// 下一 5m 窗口切换时间戳 (Unix 秒)
     pub poly_window_end_ts: i64,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
@@ -236,6 +238,7 @@ impl AppState {
             snipe_threshold_bps: 12.0,
             poly_market_slug: "Finding...".to_string(),
             poly_token_id: String::new(),
+            poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),

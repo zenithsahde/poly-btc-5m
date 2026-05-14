@@ -1,4 +1,4 @@
-use alloy_primitives::{address, keccak256, Address, B256};
+use alloy_primitives::{address, keccak256, Address, B256, U256};
 use alloy_signer::Signer as AlloySigner;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{sol, SolStruct};
@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+use crate::execution::client::{OrderSide, PlaceOrderRequest};
+
 pub const EXCHANGE_V2: Address = address!("E111180000d2663C0091e4f400237545B87B996B");
+const MICRO: f64 = 1_000_000.0;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,13 +61,26 @@ sol! {
     }
 }
 
-pub fn parse_builder_code(code: Option<&str>) -> B256 {
-    code.and_then(|s| {
-        let s = s.strip_prefix("0x").unwrap_or(s);
-        let bytes = hex::decode(s).ok()?;
-        (bytes.len() == 32).then(|| B256::from_slice(&bytes))
-    })
-    .unwrap_or(B256::ZERO)
+// BUY: maker=USDC 付出, taker=shares 收到；SELL 互为镜像。price 先 round 到 0.01 tick。
+pub fn amounts_for(side: OrderSide, price: f64, size_shares: f64) -> (u128, u128) {
+    let p = (price * 100.0).round() / 100.0;
+    let usdc = (p * size_shares * MICRO).round() as u128;
+    let shares = (size_shares * MICRO).round() as u128;
+    match side {
+        OrderSide::Buy => (usdc, shares),
+        OrderSide::Sell => (shares, usdc),
+    }
+}
+
+pub fn parse_builder_code(code: &str) -> B256 {
+    if code.is_empty() {
+        return B256::ZERO;
+    }
+    let s = code.strip_prefix("0x").unwrap_or(code);
+    hex::decode(s)
+        .ok()
+        .and_then(|bytes| (bytes.len() == 32).then(|| B256::from_slice(&bytes)))
+        .unwrap_or(B256::ZERO)
 }
 
 pub struct PolySigner {
@@ -127,6 +143,38 @@ impl PolySigner {
     #[inline]
     pub fn builder(&self) -> B256 {
         self.builder_code
+    }
+
+    pub fn build_order(&self, req: &PlaceOrderRequest, salt: u64, ts_ms: u64) -> Order {
+        let token_id = U256::from_str_radix(&req.token_id, 10).unwrap_or(U256::ZERO);
+        let (maker_micro, taker_micro) = amounts_for(req.side, req.price, req.size_shares);
+        Order {
+            salt: U256::from(salt),
+            maker: self.maker(),
+            signer: self.order_signer(),
+            tokenId: token_id,
+            makerAmount: U256::from(maker_micro),
+            takerAmount: U256::from(taker_micro),
+            side: match req.side {
+                OrderSide::Buy => 0,
+                OrderSide::Sell => 1,
+            },
+            signatureType: self.signature_type() as u8,
+            timestamp: U256::from(ts_ms),
+            metadata: B256::ZERO,
+            builder: self.builder_code,
+        }
+    }
+
+    pub async fn sign_clob_auth(&self, timestamp_secs: u64, nonce: u64) -> Result<[u8; 65]> {
+        let digest = clob_auth_digest(self.signer_address(), timestamp_secs, nonce);
+        let sig = self.key.sign_hash(&digest).await?;
+        let bytes = sig.as_bytes();
+        let v = if bytes[64] < 27 { bytes[64] + 27 } else { bytes[64] };
+        let mut out = [0u8; 65];
+        out[..64].copy_from_slice(&bytes[..64]);
+        out[64] = v;
+        Ok(out)
     }
 
     pub async fn sign_order(&self, order: &Order) -> Result<Vec<u8>> {
@@ -221,6 +269,40 @@ fn exchange_v2_domain_separator() -> B256 {
     buf[124..128].copy_from_slice(&137u32.to_be_bytes());
     buf[140..160].copy_from_slice(EXCHANGE_V2.as_slice());
     keccak256(buf)
+}
+
+// ClobAuth EIP-712 digest: domain={"ClobAuthDomain","1",137}, struct=ClobAuth(address,string,uint256,string)
+fn clob_auth_digest(address: Address, timestamp_secs: u64, nonce: u64) -> B256 {
+    const MESSAGE: &str = "This message attests that I control the given wallet";
+    let type_hash = keccak256(
+        b"ClobAuth(address address,string timestamp,uint256 nonce,string message)",
+    );
+    let ts_str = timestamp_secs.to_string();
+    let mut struct_buf = [0u8; 160];
+    struct_buf[0..32].copy_from_slice(type_hash.as_slice());
+    struct_buf[44..64].copy_from_slice(address.as_slice());
+    struct_buf[64..96].copy_from_slice(keccak256(ts_str.as_bytes()).as_slice());
+    struct_buf[96..128].copy_from_slice(&U256::from(nonce).to_be_bytes::<32>());
+    struct_buf[128..160].copy_from_slice(keccak256(MESSAGE.as_bytes()).as_slice());
+    let struct_hash = keccak256(struct_buf);
+
+    // Domain（无 verifyingContract，签名 type 含 4 字段而非 5）：
+    // EIP712Domain(string name,string version,uint256 chainId)
+    let domain_type_hash =
+        keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
+    let mut dom_buf = [0u8; 128];
+    dom_buf[0..32].copy_from_slice(domain_type_hash.as_slice());
+    dom_buf[32..64].copy_from_slice(keccak256(b"ClobAuthDomain").as_slice());
+    dom_buf[64..96].copy_from_slice(keccak256(b"1").as_slice());
+    dom_buf[124..128].copy_from_slice(&137u32.to_be_bytes());
+    let domain_sep = keccak256(dom_buf);
+
+    let mut digest_input = [0u8; 66];
+    digest_input[0] = 0x19;
+    digest_input[1] = 0x01;
+    digest_input[2..34].copy_from_slice(domain_sep.as_slice());
+    digest_input[34..66].copy_from_slice(struct_hash.as_slice());
+    keccak256(digest_input)
 }
 
 fn compute_tds_struct_hash(contents_hash: B256, deposit_wallet: Address) -> B256 {

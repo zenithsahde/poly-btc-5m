@@ -1,3 +1,7 @@
+use anyhow::Result;
+use async_trait::async_trait;
+
+use crate::execution::client::{OrderClient, PlaceOrderRequest, PlaceOrderResult};
 use crate::position::{ManagedOrder, OrderStatus, PositionSide};
 use crate::strategy::decision::BuyIntent;
 use crate::tui::app::{AppState, BookLevel, ChaseSide};
@@ -291,4 +295,45 @@ fn book_tops(s: &AppState) -> (f64, f64, f64, f64) {
         s.poly_down_best_bid,
         s.poly_down_best_ask,
     )
+}
+
+#[async_trait]
+impl OrderClient for ExecutionSim {
+    async fn place_order(&self, _req: PlaceOrderRequest) -> Result<PlaceOrderResult> {
+        Ok(PlaceOrderResult {
+            order_id: "dry".to_string(),
+            success: true,
+            status: "dry_run".to_string(),
+            filled_price: None,
+            filled_size: None,
+            error: None,
+            elapsed: 0,
+        })
+    }
+
+    async fn cancel_order(&self, _order_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn dispatch_buy_intent(
+        &self,
+        intent: &BuyIntent,
+        _best_ask: f64,
+        _token_id: &str,
+        now_ms: i64,
+        state: &mut AppState,
+    ) {
+        self.submit_buy_intent(state, intent, now_ms);
+    }
+
+    fn tick(
+        &self,
+        state: &mut AppState,
+        target_up: f64,
+        target_down: f64,
+        now_ms: i64,
+    ) -> (bool, bool) {
+        let fills = self.process(state, target_up, target_down, now_ms);
+        (fills.up, fills.down)
+    }
 }

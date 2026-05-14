@@ -10,8 +10,9 @@ use tracing::warn;
 
 use crate::{
     config::AppConfig,
-    execution::sim::ExecutionSim,
+    execution::client::OrderClient,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
+    position::PositionSide,
     strategy::{
         decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -19,7 +20,7 @@ use crate::{
         fv_snapshots::{FvRow, FvSnapshotWriter},
         volatility::RollingVolatility,
     },
-    tui::app::{AppState, BookLevel, ExcitedLead, TradeRow},
+    tui::app::{AppState, BookLevel, ChaseSide, ExcitedLead, TradeRow},
     ws::stream::MarketEvent,
 };
 
@@ -145,12 +146,16 @@ pub struct SignalEngine {
     /// v0.4.5: 同侧 taker buy 节流时间戳
     last_taker_up_ts_ms: i64,
     last_taker_down_ts_ms: i64,
-    /// Dry-run execution simulator. Strategy stays origin/main-compatible; this owns fill realism.
-    execution_sim: ExecutionSim,
+    // 干跑指向 DryOrderClient（包 ExecutionSim），实盘指向 LiveOrderClient
+    order_client: Arc<dyn OrderClient>,
 }
 
 impl SignalEngine {
-    pub fn new(config: AppConfig, state: Arc<RwLock<AppState>>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        state: Arc<RwLock<AppState>>,
+        order_client: Arc<dyn OrderClient>,
+    ) -> Self {
         let depth_limit = config.orderbook.depth_levels;
         let symbol = config.trading.symbol.clone();
         Self {
@@ -165,11 +170,7 @@ impl SignalEngine {
             fv_snapshot_writer: FvSnapshotWriter::new(),
             last_taker_up_ts_ms: 0,
             last_taker_down_ts_ms: 0,
-            execution_sim: ExecutionSim::new(
-                SIM_SUBMIT_LATENCY_MS,
-                SIM_CANCEL_LATENCY_MS,
-                MAKER_TIMEOUT_MS,
-            ),
+            order_client,
         }
     }
 
@@ -432,16 +433,16 @@ impl SignalEngine {
 
             let now_ms = chrono::Utc::now().timestamp_millis();
             if let Ok(mut s) = self.state.write() {
-                let fills = self.execution_sim.process(
+                let (up_fill, down_fill) = self.order_client.tick(
                     &mut s,
                     (fair_p - SAFETY_MARGIN).max(0.0),
                     (fair_down - SAFETY_MARGIN).max(0.0),
                     now_ms,
                 );
-                if fills.up {
+                if up_fill {
                     self.last_taker_up_ts_ms = now_ms;
                 }
-                if fills.down {
+                if down_fill {
                     self.last_taker_down_ts_ms = now_ms;
                 }
             }
@@ -517,14 +518,32 @@ impl SignalEngine {
                 self.last_taker_down_ts_ms,
             );
 
-            // 步骤 E：写展示副作用 + submit intent to execution simulator.
-            // 决策逻辑与 origin/main 对齐；成交由延迟/队列模拟器推进，避免同步假 fill。
+            // 步骤 E：写展示副作用 + dispatch 给 OrderClient。
+            // marketable 单同步推进 last_taker_*_ts_ms 节流戳（实盘无 WS fill listener）。
             if let Ok(mut s) = self.state.write() {
                 s.chase_side = effects.chase_side;
                 s.ledger.rebalance_hint_up = effects.rebalance_hint_up;
                 s.ledger.rebalance_hint_down = effects.rebalance_hint_down;
                 for intent in &intents {
-                    self.execution_sim.submit_buy_intent(&mut s, intent, now_ms);
+                    let (ask, token_id) = {
+                        match intent.side {
+                            ChaseSide::Up => {
+                                (s.poly_best_ask, s.poly_token_id.clone())
+                            }
+                            ChaseSide::Down => {
+                                (s.poly_down_best_ask, s.poly_down_token_id.clone())
+                            }
+                        }
+                    };
+                    let marketable = ask > 0.0 && ask <= intent.target;
+                    if marketable {
+                        match intent.side {
+                            PositionSide::Up => self.last_taker_up_ts_ms = now_ms,
+                            PositionSide::Down => self.last_taker_down_ts_ms = now_ms,
+                        }
+                    }
+                    self.order_client
+                        .dispatch_buy_intent(intent, ask, &token_id, now_ms, &mut s);
                 }
             }
             if let Some((win, row)) = excited_snap {
@@ -656,13 +675,13 @@ impl SignalEngine {
             let ts_ms = chrono::Utc::now().timestamp_millis();
             let target_up = (s.fair_price - SAFETY_MARGIN).max(0.0);
             let target_down = (s.fair_price_down - SAFETY_MARGIN).max(0.0);
-            let fills = self
-                .execution_sim
-                .process(&mut s, target_up, target_down, ts_ms);
-            if fills.up {
+            let (up_fill, down_fill) = self
+                .order_client
+                .tick(&mut s, target_up, target_down, ts_ms);
+            if up_fill {
                 self.last_taker_up_ts_ms = ts_ms;
             }
-            if fills.down {
+            if down_fill {
                 self.last_taker_down_ts_ms = ts_ms;
             }
 

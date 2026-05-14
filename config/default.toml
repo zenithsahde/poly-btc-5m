@@ -26,6 +26,8 @@ volatility_sigma_min = 0.1
 volatility_sigma_max = 2.0
 # 稳态下 Poly IV 的 σ 上限（用 Poly 反解时允许更高，使 FV 贴近盘口）
 volatility_sigma_max_poly = 5.0
+# 每笔 BuyIntent 的下单名义额（USDC）；必填，无代码默认。qty_shares = order_size_usdc / target_price
+order_size_usdc = 100.0
 
 [websocket]
 # 心跳间隔（秒）
@@ -63,4 +65,7 @@ level = "info"
 signature_mode = "safe"
 wallet_address = "0x0000000000000000000000000000000000000000"
 private_key = ""
-# builder_code = "0x..."
+# 32-byte hex (0x-prefixed)；留空字符串视为 zero builder
+builder_code = ""
+# Polygon RPC URL（pUSD 余额查询用）
+polygon_rpc_url = "https://polygon-rpc.com"
