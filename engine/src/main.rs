@@ -38,8 +38,12 @@ mod ws;
 
 use cli::{Cli, Mode};
 use config::AppConfig;
+use alloy_primitives::Address;
+use execution::actor::{ExecutionActor, SnipeCommand};
+use execution::signer::{parse_builder_code, PolySigner};
+use std::str::FromStr;
 use strategy::signal::SignalEngine;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tui::app::AppState;
 use ws::client::BinanceWsClient;
 use ws::poly_client::PolyWsClient;
@@ -54,7 +58,50 @@ async fn main() -> Result<()> {
 
     // ── 1. 加载配置 ────────────────────────────────────────────
     let _ = dotenvy::dotenv();
-    let cfg = AppConfig::load()?;
+    let mut cfg = AppConfig::load()?;
+
+    // ── 1b. 区分 dry-run / 实盘模式 ────────────────────────────
+    let private_key = cfg
+        .wallet
+        .as_ref()
+        .and_then(|w| w.private_key.as_deref())
+        .filter(|s| !s.is_empty());
+    let signature_mode = cfg
+        .wallet
+        .as_ref()
+        .map(|w| w.signature_mode)
+        .unwrap_or_default();
+    let wallet_address = cfg
+        .wallet
+        .as_ref()
+        .and_then(|w| w.wallet_address.as_deref())
+        .and_then(|s| Address::from_str(s).ok())
+        .unwrap_or(Address::ZERO);
+    let builder_code = parse_builder_code(
+        cfg.wallet
+            .as_ref()
+            .and_then(|w| w.builder_code.as_deref()),
+    );
+
+    if let (false, Some(pk)) = (cli.dry_run, private_key) {
+        let signer = PolySigner::new(pk, signature_mode, wallet_address, builder_code)?;
+        info!(
+            "Live mode: type={:?} maker={:?} signer={:?}",
+            signer.signature_type(),
+            signer.maker(),
+            signer.order_signer()
+        );
+        let (_exec_tx, exec_rx) = tokio::sync::mpsc::channel::<SnipeCommand>(256);
+        let actor = ExecutionActor::new(signer, exec_rx);
+        tokio::spawn(actor.run());
+    } else if cli.dry_run {
+        info!("Dry-run mode forced by --dry-run flag");
+    } else {
+        warn!("[wallet].private_key not set — dry-run mode");
+    }
+    if let Some(w) = cfg.wallet.as_mut() {
+        w.private_key = None;
+    }
 
     // ── 2. 日志（避免与 TUI 冲突）──────────────────────────────
     // 若设置 RUST_LOG=info|debug，则开启日志。默认 stderr；若设置 ENGINE_LOG_FILE=路径 则写入该文件便于排查

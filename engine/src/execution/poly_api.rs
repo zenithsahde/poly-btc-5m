@@ -1,6 +1,4 @@
-/// execution/poly_api.rs - Polymarket CLOB 订单提交模块
-/// 负责将签名后的 Order 对象发送至后端 REST API
-use crate::execution::signer::Order;
+use crate::execution::signer::{CancelOrder, Order};
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::json;
@@ -20,47 +18,38 @@ impl PolyApiSubmitter {
         }
     }
 
-    /// 提交订单至 Polymarket
     pub async fn submit_order(&self, order: Order, signature: Vec<u8>) -> Result<String> {
         let url = format!("{}/order", self.base_url);
         let sig_hex = format!("0x{}", hex::encode(signature));
 
         let payload = json!({
             "order": {
-                "salt": order.salt.to_string(),
-                "maker": format!("{:?}", order.maker),
-                "signer": format!("{:?}", order.signer),
-                "taker": format!("{:?}", order.taker),
-                "tokenId": order.tokenId.to_string(),
-                "makerAmount": order.makerAmount.to_string(),
-                "takerAmount": order.takerAmount.to_string(),
-                "expiration": order.expiration.to_string(),
-                "nonce": order.nonce.to_string(),
-                "feeRateBps": order.feeRateBps.to_string(),
-                "side": order.side.to_string(),
+                "salt":          order.salt.to_string(),
+                "maker":         format!("{:?}", order.maker),
+                "signer":        format!("{:?}", order.signer),
+                "tokenId":       order.tokenId.to_string(),
+                "makerAmount":   order.makerAmount.to_string(),
+                "takerAmount":   order.takerAmount.to_string(),
+                "side":          order.side,
                 "signatureType": order.signatureType,
+                "timestamp":     order.timestamp.to_string(),
+                "metadata":      format!("0x{}", hex::encode(order.metadata)),
+                "builder":       format!("0x{}", hex::encode(order.builder)),
             },
             "signature": sig_hex,
         });
 
-        info!("Sending Order to Poly: {}", url);
+        info!("Sending V2 Order to Poly: {}", url);
         let resp = self.client.post(url).json(&payload).send().await?;
         self.handle_response(resp).await
     }
 
-    /// 撤销订单
-    pub async fn cancel_order(
-        &self,
-        cancel: crate::execution::signer::CancelOrder,
-        signature: Vec<u8>,
-    ) -> Result<String> {
+    pub async fn cancel_order(&self, cancel: CancelOrder, signature: Vec<u8>) -> Result<String> {
         let url = format!("{}/order", self.base_url);
         let sig_hex = format!("0x{}", hex::encode(signature));
 
         let payload = json!({
-            "order": {
-                "orderHash": format!("{:?}", cancel.orderHash),
-            },
+            "order": { "orderHash": format!("{:?}", cancel.orderHash) },
             "signature": sig_hex,
         });
 

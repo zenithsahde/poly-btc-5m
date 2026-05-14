@@ -15,14 +15,31 @@ Binance WebSocket + Polymarket 5m 做市引擎：基于公允价（Fair Value）
 
 ```bash
 cargo build --release
-cargo run --release
 ```
 
-默认读取 `config/default.toml`，可通过环境变量或 `CONFIG` 指定其它配置文件。
+启动时按以下规则区分 dry-run 与实盘：
+
+- `[wallet].private_key` 留空或省略整段 → **dry-run**（不下真实订单）
+- 配置了 `[wallet].private_key` → **Live 模式**
+- 任何时候带 `--dry-run` 命令行参数 → **强制 dry-run**（即使配了私钥也忽略）
+
+```bash
+# Dry-run（默认）：不配私钥
+cargo run --release
+
+# Live 模式：在 config/default.toml 的 [wallet] 段填入 private_key 后启动
+cargo run --release
+
+# 强制 dry-run（即使配了私钥）
+cargo run --release -- --dry-run
+```
+
+默认读取 `config/default.toml`。
 
 ## 配置要点
 
-- `[trading]`：`symbol`（如 BTCUSDT）、`poly_token_id`、`wallet_address`、`strike_price`、波动率默认与裁剪
+- `[wallet]`：`signature_mode`（`eoa` / `safe` / `deposit_wallet`）、`wallet_address`、`private_key`（留空 → dry-run；填入 → Live）、可选 `builder_code`
+- `[trading]`：`symbol`（如 BTCUSDT）、`poly_token_id`、`strike_price`、波动率默认与裁剪
 - `[exchange]`：币安 WS/REST 端点
 - `[orderbook]`：`depth_levels`（订单簿档位）
 
