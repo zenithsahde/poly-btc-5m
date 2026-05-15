@@ -109,6 +109,26 @@ async fn main() -> Result<()> {
         info!("API key derived: {}…", api_key.get(..8).unwrap_or(&api_key));
         let creds = ApiCreds::new(&api_key, &secret, &passphrase)?;
 
+        // User channel WS：订阅本账户所有市场的 order / trade 事件。
+        // 暂时只投递到 mpsc + tracing；后续接 AppState/ledger 回灌 fill。
+        let (user_ev_tx, mut user_ev_rx) = tokio::sync::mpsc::channel(256);
+        let user_ws = Arc::new(ws::poly_user_ws::PolyUserWs::new(
+            api_key, secret, passphrase, user_ev_tx,
+        ));
+        tokio::spawn(user_ws.run());
+        tokio::spawn(async move {
+            while let Some(ev) = user_ev_rx.recv().await {
+                match ev {
+                    ws::poly_user_ws::UserEvent::Order(o) => {
+                        info!(?o, "poly user order event")
+                    }
+                    ws::poly_user_ws::UserEvent::Trade(t) => {
+                        info!(?t, "poly user trade event")
+                    }
+                }
+            }
+        });
+
         let rpc_url = cfg
             .wallet
             .as_ref()
