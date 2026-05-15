@@ -24,7 +24,8 @@ engine.log
 # Secrets / local env
 .env
 .env.local
-config/local.toml
+# 本地配置（含私钥）；模板见 config.toml.example
+/config.toml
 
 # Tooling state
 .claude/

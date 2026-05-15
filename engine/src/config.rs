@@ -1,5 +1,5 @@
 /// config.rs - 配置加载模块
-/// 从 config/default.toml + 环境变量中加载配置
+/// 从根目录 config.toml + 环境变量中加载配置
 use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
@@ -79,6 +79,38 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_cb_enabled")]
+    pub enabled: bool,
+    /// 当日 cash_pnl 亏损超过该 USDC 数额即永久熔断
+    #[serde(default = "default_cb_max_daily_loss")]
+    pub max_daily_loss: f64,
+    /// 连续下单错误（rejected / transport failed）超过该值即永久熔断
+    #[serde(default = "default_cb_max_consecutive_errors")]
+    pub max_consecutive_errors: u32,
+}
+
+fn default_cb_enabled() -> bool {
+    true
+}
+fn default_cb_max_daily_loss() -> f64 {
+    50.0
+}
+fn default_cb_max_consecutive_errors() -> u32 {
+    5
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cb_enabled(),
+            max_daily_loss: default_cb_max_daily_loss(),
+            max_consecutive_errors: default_cb_max_consecutive_errors(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WalletConfig {
     #[serde(default)]
@@ -104,14 +136,16 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub wallet: Option<WalletConfig>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        // 配置加载优先级：default.toml < 环境变量
+        // 配置加载优先级：根目录 config.toml < 环境变量
         // 环境变量格式：APP__TRADING__SYMBOL=ETHUSDT（双下划线分隔层级）
         let config = Config::builder()
-            .add_source(File::with_name("config/default"))
+            .add_source(File::with_name("config"))
             .add_source(
                 Environment::with_prefix("APP")
                     .separator("__")
