@@ -4,6 +4,8 @@ pub mod gateway;
 pub mod ioc;
 pub mod merge;
 pub mod order_manager;
+pub mod resubmit;
 pub mod signer;
 pub mod sim;
 pub mod transaction;
+pub mod user_ws_handler;

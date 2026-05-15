@@ -1,4 +1,5 @@
 use chrono::TimeZone;
+use rustc_hash::FxHashSet;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -281,6 +282,8 @@ pub struct PositionLedger {
     pub rebalance_hint_up: Option<(f64, f64)>,
     /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_down: Option<(f64, f64)>,
+    /// 实盘 user-ws trade 事件去重（trade_id）。本窗口内存活，`reset_for_new_window` 时清空。
+    pub seen_fill_ids: FxHashSet<String>,
 }
 
 impl PositionLedger {
@@ -464,14 +467,21 @@ impl PositionLedger {
         up_ask: f64,
         down_bid: f64,
         down_ask: f64,
+        fee_bps_override: Option<f64>,
     ) {
         debug_assert!(buy_sell, "apply_fill 只支持 buy；sell 由 apply_merge 处理");
         if !buy_sell {
             return;
         }
 
-        let p_clamped = price.clamp(0.0, 1.0);
-        let taker_fee = qty * 0.072 * p_clamped * (1.0 - p_clamped);
+        // 优先使用 WS 真值 fee_rate_bps；缺失则 fallback 到 dry-run 公式（qty × 7.2bps × p × (1-p)）
+        let taker_fee = match fee_bps_override {
+            Some(bps) if bps > 0.0 => qty * price * (bps / 10_000.0),
+            _ => {
+                let p_clamped = price.clamp(0.0, 1.0);
+                qty * 0.072 * p_clamped * (1.0 - p_clamped)
+            }
+        };
         if maker_taker {
             self.total_rebate += taker_fee * 0.25;
         } else {
@@ -612,6 +622,7 @@ impl PositionLedger {
         }
         self.rebalance_hint_up = None;
         self.rebalance_hint_down = None;
+        self.seen_fill_ids.clear();
     }
 
     // merge 由调用方在写锁外异步完成，这里只处理胜出方赎回

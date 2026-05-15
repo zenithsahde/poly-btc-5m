@@ -9,6 +9,7 @@ orders/
 fv_snapshots/
 excited_snapshots/
 snapshots_30ms/
+webui_db/
 
 # Logs
 *.log

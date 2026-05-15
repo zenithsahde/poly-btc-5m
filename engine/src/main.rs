@@ -44,6 +44,7 @@ use execution::client::OrderClient;
 use execution::merge::build_merge_client;
 use execution::sim::ExecutionSim;
 use execution::signer::{parse_builder_code, PolySigner};
+use execution::resubmit::{run_resubmit_worker, ResubmitRequest};
 use execution::transaction::{build_http2_client, derive_api_key, ApiCreds, LiveOrderClient};
 use std::str::FromStr;
 use strategy::signal::SignalEngine;
@@ -95,6 +96,9 @@ async fn main() -> Result<()> {
     // state 提前到此处构造，以便注入 LiveOrderClient
     let state = Arc::new(RwLock::new(AppState::new(&cfg.trading.symbol)));
 
+    // SQLite writer：所有持久化（pnl_samples / my_orders / my_fills）走 mpsc，POST 热路径不阻塞。
+    let db_tx = web::spawn_db_writer()?;
+
     let order_client: Arc<dyn OrderClient> = if let (false, Some(pk)) = (cli.dry_run, private_key) {
         let signer = PolySigner::new(pk, signature_mode, wallet_address, builder_code)?;
         info!(
@@ -109,25 +113,17 @@ async fn main() -> Result<()> {
         info!("API key derived: {}…", api_key.get(..8).unwrap_or(&api_key));
         let creds = ApiCreds::new(&api_key, &secret, &passphrase)?;
 
-        // User channel WS：订阅本账户所有市场的 order / trade 事件。
-        // 暂时只投递到 mpsc + tracing；后续接 AppState/ledger 回灌 fill。
-        let (user_ev_tx, mut user_ev_rx) = tokio::sync::mpsc::channel(256);
+        // User channel WS：订阅本账户所有市场的 order / trade 事件，回灌 ledger + my_orders/my_fills。
+        let (user_ev_tx, user_ev_rx) = tokio::sync::mpsc::channel(256);
         let user_ws = Arc::new(ws::poly_user_ws::PolyUserWs::new(
             api_key, secret, passphrase, user_ev_tx,
         ));
         tokio::spawn(user_ws.run());
-        tokio::spawn(async move {
-            while let Some(ev) = user_ev_rx.recv().await {
-                match ev {
-                    ws::poly_user_ws::UserEvent::Order(o) => {
-                        info!(?o, "poly user order event")
-                    }
-                    ws::poly_user_ws::UserEvent::Trade(t) => {
-                        info!(?t, "poly user trade event")
-                    }
-                }
-            }
-        });
+        tokio::spawn(execution::user_ws_handler::run_user_event_handler(
+            user_ev_rx,
+            Arc::clone(&state),
+            db_tx.clone(),
+        ));
 
         let rpc_url = cfg
             .wallet
@@ -160,9 +156,16 @@ async fn main() -> Result<()> {
             MAIN_MAKER_TIMEOUT_MS,
             Arc::clone(&state),
             http,
+            db_tx.clone(),
         )
         .await?;
         live.attach_merge_client(Arc::new(merge_client));
+
+        // Resubmit 链：tx 注入 LiveOrderClient + worker spawn
+        let (resubmit_tx, resubmit_rx) = tokio::sync::mpsc::unbounded_channel::<ResubmitRequest>();
+        live.attach_resubmit_tx(resubmit_tx.clone());
+        let resub_shared = live.shared();
+        tokio::spawn(run_resubmit_worker(resubmit_rx, resub_shared, resubmit_tx));
         Arc::new(live)
     } else {
         if cli.dry_run {
@@ -340,7 +343,7 @@ async fn main() -> Result<()> {
                 cli.host, cli.port
             );
             tokio::select! {
-                r = web::serve(Arc::clone(&state), &cli.host, cli.port, &cli.web_dist) => r,
+                r = web::serve(Arc::clone(&state), db_tx.clone(), &cli.host, cli.port, &cli.web_dist) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("\n👋 收到 Ctrl+C，关闭中...");
                     Ok(())

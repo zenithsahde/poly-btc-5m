@@ -25,14 +25,16 @@ pub struct PlaceOrderRequest {
     pub order_type: OrderType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlaceOrderResult {
     pub order_id: String,
     pub success: bool,
     pub status: String,
-    pub filled_price: Option<f64>,
-    pub filled_size: Option<f64>,
-    pub error: Option<String>,
+    pub making_amount: Option<f64>,
+    pub taking_amount: Option<f64>,
+    pub transactions_hashes: Vec<String>,
+    pub trade_ids: Vec<String>,
+    pub error_msg: Option<String>,
     pub elapsed: u64,
 }
 

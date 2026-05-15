@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 
+use alloy_primitives::B256;
+
 use crate::position::PositionLedger;
 pub use crate::position::PositionSide as ChaseSide;
 
@@ -165,6 +167,8 @@ pub struct AppState {
     pub poly_down_token_id: String,
     /// 下一 5m 窗口切换时间戳 (Unix 秒)
     pub poly_window_end_ts: i64,
+    /// 当前市场的 CTF condition_id（merge / 实盘下单 my_orders 记账用）
+    pub poly_condition_id: B256,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
     pub poly_bids: Vec<BookLevel>,
     /// Poly Up 订单簿卖盘（价格升序，最多 15 档）
@@ -240,6 +244,7 @@ impl AppState {
             poly_token_id: String::new(),
             poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
+            poly_condition_id: B256::ZERO,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),
             poly_best_bid: 0.0,
@@ -412,6 +417,7 @@ impl AppState {
         up_ask: f64,
         down_bid: f64,
         down_ask: f64,
+        fee_bps_override: Option<f64>,
     ) {
         self.ledger.apply_fill(
             side,
@@ -425,6 +431,7 @@ impl AppState {
             up_ask,
             down_bid,
             down_ask,
+            fee_bps_override,
         );
     }
 

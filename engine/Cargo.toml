@@ -90,6 +90,9 @@ rand = "0.8"
 # 字节缓冲（HTTP body）
 bytes = "1"
 
+# 快速哈希集合（user-ws trade_id 去重）
+rustc-hash = "2"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
