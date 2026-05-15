@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>poly-btc-5m · Live Dashboard</title>
+
+  <!-- Tailwind v3 CDN（JIT、即时编译）。生产可换成 trunk + tailwindcss 预编译。 -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            bg: '#0a0a0a',
+            card: '#111114',
+            border: '#1f1f23',
+            muted: '#71717a',
+            accent: '#22c55e',
+            'accent-2': '#3b82f6',
+            danger: '#ef4444',
+          },
+          fontFamily: {
+            mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+            sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+          }
+        }
+      }
+    };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link data-trunk rel="css" href="style.css" />
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+</head>
+<body class="bg-bg text-zinc-200 font-sans antialiased min-h-screen">
+  <div id="app"></div>
+</body>
+</html>
