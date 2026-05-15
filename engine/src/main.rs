@@ -166,6 +166,10 @@ async fn main() -> Result<()> {
         live.attach_resubmit_tx(resubmit_tx.clone());
         let resub_shared = live.shared();
         tokio::spawn(run_resubmit_worker(resubmit_rx, resub_shared, resubmit_tx));
+
+        if let Ok(mut s) = state.write() {
+            s.is_live_mode = true;
+        }
         Arc::new(live)
     } else {
         if cli.dry_run {
