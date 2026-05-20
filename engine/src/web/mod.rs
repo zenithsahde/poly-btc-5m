@@ -15,10 +15,12 @@ use tracing::{info, warn};
 
 use crate::tui::app::AppState;
 
-mod db;
+pub mod db;
 mod routes;
 mod snapshot;
 mod sse;
+
+pub use db::{spawn_db_writer, DbMsg, DbSender};
 
 #[derive(Clone)]
 pub struct WebState {
@@ -27,6 +29,7 @@ pub struct WebState {
 
 pub async fn serve(
     app_state: Arc<RwLock<AppState>>,
+    db_tx: DbSender,
     host: &str,
     port: u16,
     dist_dir: &str,
@@ -39,7 +42,7 @@ pub async fn serve(
         );
     }
 
-    spawn_web_pnl_sampler(Arc::clone(&app_state));
+    spawn_web_pnl_sampler(Arc::clone(&app_state), db_tx);
     let state = WebState { app_state };
     let app = routes::router(state, dist_path);
 
@@ -59,21 +62,18 @@ pub async fn serve(
     Ok(())
 }
 
-fn spawn_web_pnl_sampler(app_state: Arc<RwLock<AppState>>) {
+fn spawn_web_pnl_sampler(app_state: Arc<RwLock<AppState>>, db_tx: DbSender) {
     tokio::spawn(async move {
         loop {
-            let persist_result = match app_state.write() {
-                Ok(mut s) => s
-                    .record_web_pnl_sample()
-                    .map(|point| db::persist_sample(&s, &point)),
+            let sample = match app_state.write() {
+                Ok(mut s) => s.record_web_pnl_sample(),
                 Err(p) => {
                     let mut s = p.into_inner();
                     s.record_web_pnl_sample()
-                        .map(|point| db::persist_sample(&s, &point))
                 }
             };
-            if let Some(Err(err)) = persist_result {
-                warn!("Web UI SQLite persistence failed: {err:#}");
+            if let Some(point) = sample {
+                let _ = db_tx.send(DbMsg::PnlSample(point));
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }

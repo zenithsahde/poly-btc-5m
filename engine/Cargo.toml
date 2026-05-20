@@ -1,6 +1,6 @@
 [package]
 name = "rust_engine"
-version = "0.4.5-5m"
+version = "0.4.6-5m"
 edition = "2021"
 authors = ["SJ Trading Engine"]
 description = "Binance WebSocket + Polymarket 5m 做市引擎（fork from market-maker@marker-fv）"
@@ -66,7 +66,32 @@ alloy-primitives = { version = "0.8", features = ["serde"] }
 alloy-sol-types = { version = "0.8" }
 alloy-signer = { version = "0.5" }
 alloy-signer-local = { version = "0.5" }
+# Polygon RPC for pUSD balance query
+alloy-provider = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-rpc-client = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-contract = { version = "0.5", default-features = false }
+# merge_positions 链上交易（EOA 路径要构造 / 发送 / 等回执）
+alloy-network = { version = "0.5", default-features = false }
+alloy-rpc-types-eth = { version = "0.5", default-features = false }
 hex = "0.4"
+
+# 异步 trait 抽象（OrderClient）
+async-trait = "0.1"
+
+# L2 HMAC auth (POLY_SIGNATURE)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# 随机 salt
+rand = "0.8"
+
+# 字节缓冲（HTTP body）
+bytes = "1"
+
+# 快速哈希集合（user-ws trade_id 去重）
+rustc-hash = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

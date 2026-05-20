@@ -125,14 +125,30 @@ pub fn HeaderBar() -> impl IntoView {
                 .unwrap_or_default()
         })
     });
+    let mode_label = Signal::derive(move || {
+        let live = snapshot.with(|s| s.as_ref().map(|s| s.header.is_live_mode).unwrap_or(false));
+        if live {
+            "Polymarket BTC 5m · 🔴 LIVE"
+        } else {
+            "Polymarket BTC 5m · ⚫ DRY-RUN"
+        }
+    });
+    let mode_class = Signal::derive(move || {
+        let live = snapshot.with(|s| s.as_ref().map(|s| s.header.is_live_mode).unwrap_or(false));
+        if live {
+            "text-xs text-red-400 uppercase tracking-widest font-semibold"
+        } else {
+            "text-xs text-zinc-500 uppercase tracking-widest"
+        }
+    });
 
     view! {
         <header class="topbar">
             <div class="topbar-main">
                 <div class="brand-block">
                     <div class="text-xl font-bold tracking-tight">"rust_engine"</div>
-                    <div class="text-xs text-zinc-500 uppercase tracking-widest">
-                        "Polymarket BTC 5m · Live"
+                    <div class=move || mode_class.get()>
+                        {move || mode_label.get()}
                     </div>
                 </div>
                 <div class="top-stats">

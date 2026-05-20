@@ -10,9 +10,9 @@ use tracing::warn;
 
 use crate::{
     config::AppConfig,
-    execution::sim::ExecutionSim,
+    execution::client::OrderClient,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
-    position::PendingOrderReason,
+    position::{PendingOrderReason, PositionSide},
     strategy::{
         decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -20,7 +20,7 @@ use crate::{
         fv_snapshots::{FvRow, FvSnapshotWriter},
         volatility::RollingVolatility,
     },
-    tui::app::{AppState, BookLevel, ExcitedLead, TradeRow},
+    tui::app::{AppState, BookLevel, ChaseSide, ExcitedLead, TradeRow},
     ws::stream::MarketEvent,
 };
 
@@ -143,12 +143,16 @@ pub struct SignalEngine {
     /// v0.4.5: 同侧 taker buy 节流时间戳
     last_taker_up_ts_ms: i64,
     last_taker_down_ts_ms: i64,
-    /// Dry-run execution simulator. Strategy stays origin/main-compatible; this owns fill realism.
-    execution_sim: ExecutionSim,
+    // 干跑指向 DryOrderClient（包 ExecutionSim），实盘指向 LiveOrderClient
+    order_client: Arc<dyn OrderClient>,
 }
 
 impl SignalEngine {
-    pub fn new(config: AppConfig, state: Arc<RwLock<AppState>>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        state: Arc<RwLock<AppState>>,
+        order_client: Arc<dyn OrderClient>,
+    ) -> Self {
         let depth_limit = config.orderbook.depth_levels;
         let symbol = config.trading.symbol.clone();
         Self {
@@ -163,7 +167,7 @@ impl SignalEngine {
             fv_snapshot_writer: FvSnapshotWriter::new(),
             last_taker_up_ts_ms: 0,
             last_taker_down_ts_ms: 0,
-            execution_sim: ExecutionSim::new(SIM_SUBMIT_LATENCY_MS),
+            order_client,
         }
     }
 
@@ -426,17 +430,19 @@ impl SignalEngine {
 
             let now_ms = chrono::Utc::now().timestamp_millis();
             if let Ok(mut s) = self.state.write() {
-                let fills = self.execution_sim.process(
+                let target_up = compute_target(&s, ChaseSide::Up, fair_p);
+                let target_down = compute_target(&s, ChaseSide::Down, fair_down);
+                let (up_fill, down_fill) = self.order_client.tick(
                     &mut s,
-                    (fair_p - SAFETY_MARGIN).max(0.0),
-                    (fair_down - SAFETY_MARGIN).max(0.0),
+                    target_up,
+                    target_down,
                     expiry_min <= FORCE_TAKER_REBAL_EXPIRY_MIN,
                     now_ms,
                 );
-                if fills.up {
+                if up_fill {
                     self.last_taker_up_ts_ms = now_ms;
                 }
-                if fills.down {
+                if down_fill {
                     self.last_taker_down_ts_ms = now_ms;
                 }
             }
@@ -513,14 +519,32 @@ impl SignalEngine {
                 self.last_taker_down_ts_ms,
             );
 
-            // 步骤 E：写展示副作用 + submit intent to execution simulator.
-            // 决策逻辑与 origin/main 对齐；成交由延迟/队列模拟器推进，避免同步假 fill。
+            // 步骤 E：写展示副作用 + dispatch 给 OrderClient。
+            // marketable 单同步推进 last_taker_*_ts_ms 节流戳（实盘无 WS fill listener）。
             if let Ok(mut s) = self.state.write() {
                 s.chase_side = effects.chase_side;
                 s.ledger.rebalance_hint_up = effects.rebalance_hint_up;
                 s.ledger.rebalance_hint_down = effects.rebalance_hint_down;
                 for intent in &intents {
-                    self.execution_sim.submit_buy_intent(&mut s, intent, now_ms);
+                    let (ask, token_id) = {
+                        match intent.side {
+                            ChaseSide::Up => {
+                                (s.poly_best_ask, s.poly_token_id.clone())
+                            }
+                            ChaseSide::Down => {
+                                (s.poly_down_best_ask, s.poly_down_token_id.clone())
+                            }
+                        }
+                    };
+                    let marketable = ask > 0.0 && ask <= intent.target;
+                    if marketable {
+                        match intent.side {
+                            PositionSide::Up => self.last_taker_up_ts_ms = now_ms,
+                            PositionSide::Down => self.last_taker_down_ts_ms = now_ms,
+                        }
+                    }
+                    self.order_client
+                        .dispatch_buy_intent(intent, ask, &token_id, now_ms, &mut s);
                 }
             }
             if let Some((win, row)) = excited_snap {
@@ -650,42 +674,20 @@ impl SignalEngine {
 
             // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
             let ts_ms = chrono::Utc::now().timestamp_millis();
-            let target_up = if s
-                .ledger
-                .maker_buy_intent_up
-                .as_ref()
-                .map(|o| o.reason == PendingOrderReason::Rebalance)
-                .unwrap_or(false)
-                && s.ledger.position_down.avg_price > 0.0
-            {
-                (1.0 - s.ledger.position_down.avg_price - REBALANCE_MARGIN).max(0.0)
-            } else {
-                (s.fair_price - SAFETY_MARGIN).max(0.0)
-            };
-            let target_down = if s
-                .ledger
-                .maker_buy_intent_down
-                .as_ref()
-                .map(|o| o.reason == PendingOrderReason::Rebalance)
-                .unwrap_or(false)
-                && s.ledger.position_up.avg_price > 0.0
-            {
-                (1.0 - s.ledger.position_up.avg_price - REBALANCE_MARGIN).max(0.0)
-            } else {
-                (s.fair_price_down - SAFETY_MARGIN).max(0.0)
-            };
+            let target_up = compute_target(&s, ChaseSide::Up, s.fair_price);
+            let target_down = compute_target(&s, ChaseSide::Down, s.fair_price_down);
             let force_rebalance_taker = s.expiry_minutes <= FORCE_TAKER_REBAL_EXPIRY_MIN;
-            let fills = self.execution_sim.process(
+            let (up_fill, down_fill) = self.order_client.tick(
                 &mut s,
                 target_up,
                 target_down,
                 force_rebalance_taker,
                 ts_ms,
             );
-            if fills.up {
+            if up_fill {
                 self.last_taker_up_ts_ms = ts_ms;
             }
-            if fills.down {
+            if down_fill {
                 self.last_taker_down_ts_ms = ts_ms;
             }
 
@@ -741,5 +743,27 @@ impl SignalEngine {
         if let Some((win, row)) = fv_snap_pending {
             self.fv_snapshot_writer.push(win, row);
         }
+    }
+}
+
+/// 配平腿目标价 = (1 - 对侧 avg) - REBALANCE_MARGIN；其它单 = fair - SAFETY_MARGIN。
+fn compute_target(s: &AppState, side: ChaseSide, fair: f64) -> f64 {
+    let (pending, opp_avg) = match side {
+        PositionSide::Up => (
+            s.ledger.maker_buy_intent_up.as_ref(),
+            s.ledger.position_down.avg_price,
+        ),
+        PositionSide::Down => (
+            s.ledger.maker_buy_intent_down.as_ref(),
+            s.ledger.position_up.avg_price,
+        ),
+    };
+    let is_rebal = pending
+        .map(|o| o.reason == PendingOrderReason::Rebalance)
+        .unwrap_or(false);
+    if is_rebal && opp_avg > 0.0 {
+        (1.0 - opp_avg - REBALANCE_MARGIN).max(0.0)
+    } else {
+        (fair - SAFETY_MARGIN).max(0.0)
     }
 }

@@ -273,6 +273,17 @@ fn render_title(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         )
     };
 
+    let mode_indicator = if s.is_live_mode {
+        Span::styled(
+            "  🔴 LIVE",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("  ⚫ DRY-RUN", Style::default().fg(Color::DarkGray))
+    };
+
     let title = Line::from(vec![
         Span::styled(
             "  🦀 SJ Engine  ",
@@ -288,6 +299,7 @@ fn render_title(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         ),
         Span::raw("  "),
         conn_indicator,
+        mode_indicator,
         Span::styled(
             format!("  {:.0} msg/s", s.msg_rate),
             Style::default().fg(Color::White),

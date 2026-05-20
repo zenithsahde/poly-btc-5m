@@ -1,5 +1,12 @@
 # ──────────────────────────────────────────────
-# SJ Trading Engine - 默认配置
+# SJ Trading Engine - 配置模板
+#
+# 用法：
+#   cp config.toml.example config.toml
+#   # 然后在 [wallet] 段填入 private_key / wallet_address
+#   # 币安 API key 通过环境变量 BINANCE_API_KEY / BINANCE_SECRET_KEY 注入
+#
+# 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
 # ──────────────────────────────────────────────
 
 [exchange]
@@ -15,10 +22,8 @@ rest_endpoint = "https://api.binance.com"
 symbol = "BTCUSDT"
 # 订阅的数据流
 streams = ["bookTicker", "depth@100ms", "aggTrade"]
-# Polymarket BTC Price (Yes) Token ID
+# Polymarket BTC Price (Yes) Token ID（留空启用 5m 自动发现）
 poly_token_id = ""
-# 个人钱包地址 (用于下单)
-wallet_address = "0x0000000000000000000000000000000000000000"
 # 5m 公允价：行权价 K（未从 Poly 解析时使用）
 strike_price = 96000.0
 # 5m 公允价：波动率 σ 默认值（样本不足时）
@@ -28,6 +33,8 @@ volatility_sigma_min = 0.1
 volatility_sigma_max = 2.0
 # 稳态下 Poly IV 的 σ 上限（用 Poly 反解时允许更高，使 FV 贴近盘口）
 volatility_sigma_max_poly = 5.0
+# 每笔 BuyIntent 的下单名义额（USDC）；必填，无代码默认。qty_shares = order_size_usdc / target_price
+order_size_usdc = 100.0
 
 [websocket]
 # 心跳间隔（秒）
@@ -59,3 +66,24 @@ secret_key = ""
 [logging]
 # 日志级别：trace / debug / info / warn / error
 level = "info"
+
+[circuit_breaker]
+# 自动熔断：cash_pnl 亏损或连续下单错误超阈值后，永久阻止 LiveOrderClient 继续下单
+# （需重启进程恢复）。仅作用于实盘，dry-run/ExecutionSim 不受影响。
+enabled = true
+# 当日已实现 cash_pnl 亏损超过该 USDC 数额即熔断
+max_daily_loss = 50.0
+# 连续下单错误次数（rejected / transport failed）达到该值即熔断
+max_consecutive_errors = 5
+
+[wallet]
+# 钱包类型: eoa | safe | deposit_wallet
+signature_mode = "safe"
+# TODO: 实盘填入实际地址
+wallet_address = "0x0000000000000000000000000000000000000000"
+# TODO: 实盘填入私钥（hex，0x 前缀）；留空 = dry-run 模式
+private_key = ""
+# 32-byte hex (0x-prefixed)；留空字符串视为 zero builder
+builder_code = ""
+# Polygon RPC URL（pUSD 余额查询用）
+polygon_rpc_url = "https://polygon-rpc.com"

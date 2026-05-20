@@ -33,6 +33,7 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         total_msgs: s.total_msgs,
         uptime: s.uptime(),
         uptime_secs: s.start_time.elapsed().as_secs(),
+        is_live_mode: s.is_live_mode,
     };
 
     let orderbook = OrderbookView {

@@ -25,6 +25,7 @@ pub struct HeaderInfo {
     pub total_msgs: u64,
     pub uptime: String,
     pub uptime_secs: u64,
+    pub is_live_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
