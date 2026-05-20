@@ -436,6 +436,11 @@ impl AppState {
             down_ask,
             fee_bps_override,
         );
+        // Stamp the net_pnl snapshot on the TradeRecord we just pushed.
+        let pnl_now = self.net_pnl();
+        if let Some(tr) = self.ledger.trades_current_window.last_mut() {
+            tr.snapshot_pnl = pnl_now;
+        }
     }
 
     /// 市场切换时：将本窗口成交记录写入文件（每笔含 side/方向/maker_taker/price/qty/ts_ms），再清空内存；只保留最新 10 份文件

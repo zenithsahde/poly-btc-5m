@@ -523,7 +523,7 @@ fn order_events(
             ),
             qty: order.remaining_qty(),
             price: order.price,
-            pnl: current_pnl,
+            pnl: current_pnl, // pending orders use live pnl (they haven't settled yet)
         });
     }
 
@@ -543,7 +543,7 @@ fn order_events(
             ),
             qty: trade.qty,
             price: trade.price,
-            pnl: current_pnl,
+            pnl: trade.snapshot_pnl,
         });
     }
 
@@ -564,7 +564,7 @@ fn order_events(
             } else {
                 order.price
             },
-            pnl: current_pnl,
+            pnl: order.snapshot_pnl,
         });
     }
 

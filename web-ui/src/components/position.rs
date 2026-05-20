@@ -37,23 +37,28 @@ pub fn PositionPanel() -> impl IntoView {
             .unwrap_or_else(|| "—".to_string())
     }));
     let merge_pnl = Signal::derive(move || fmt_money(snapshot.with(|s| s.as_ref().map(|s| s.position.merge_pnl).unwrap_or(0.0))));
-    let fee = Signal::derive(move || format!("-{:.4}", snapshot.with(|s| s.as_ref().map(|s| s.position.total_fee).unwrap_or(0.0))));
-    let rebate = Signal::derive(move || format!("+{:.4}", snapshot.with(|s| s.as_ref().map(|s| s.position.total_rebate).unwrap_or(0.0))));
+    let fee_value = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.position.total_fee).unwrap_or(0.0)));
+    let rebate_value = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.position.total_rebate).unwrap_or(0.0)));
+    let paid_value = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.position.cash_paid).unwrap_or(0.0)));
+    let received_value = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.position.cash_received).unwrap_or(0.0)));
+    let fee = Signal::derive(move || format!("-{:.4}", fee_value.get()));
+    let rebate = Signal::derive(move || format!("+{:.4}", rebate_value.get()));
+    let paid = Signal::derive(move || format!("-{:.4}", paid_value.get()));
+    let received = Signal::derive(move || format!("+{:.4}", received_value.get()));
     let cash_pnl = Signal::derive(move || fmt_money(snapshot.with(|s| s.as_ref().map(|s| s.position.cash_pnl).unwrap_or(0.0))));
     let inv_val = Signal::derive(move || format!("{:.4}", snapshot.with(|s| s.as_ref().map(|s| s.position.inventory_value).unwrap_or(0.0))));
-    let cash_flow = Signal::derive(move || snapshot.with(|s| {
-        s.as_ref()
-            .map(|s| format!("paid -{:.2} / recv +{:.2}", s.position.cash_paid, s.position.cash_received))
-            .unwrap_or_else(|| "—".to_string())
-    }));
+    let capital_note = Signal::derive(move || {
+        format!(
+            "recv {} + inv {} - paid {} - fee {} + rebate {}",
+            received.get(),
+            inv_val.get(),
+            paid.get(),
+            fee.get(),
+            rebate.get()
+        )
+    });
     let net = Signal::derive(move || snapshot.with(|s| s.as_ref().map(|s| s.position.net_pnl).unwrap_or(0.0)));
     let net_text = Signal::derive(move || fmt_money(net.get()));
-    let net_class = Signal::derive(move || {
-        let v = net.get();
-        if v > 0.0 { "text-2xl font-semibold numeric cell-bid" }
-        else if v < 0.0 { "text-2xl font-semibold numeric cell-ask" }
-        else { "text-2xl font-semibold numeric text-zinc-200" }
-    });
     let chase = Signal::derive(move || snapshot.with(|s| s.as_ref().and_then(|s| s.position.chase_side.clone()).unwrap_or_else(|| "—".into())));
     let pending_up = Signal::derive(move || snapshot.with(|s| {
         s.as_ref()
@@ -137,57 +142,80 @@ pub fn PositionPanel() -> impl IntoView {
     }));
 
     view! {
-        <div class="card">
+        <div class="card position-card">
             <div class="flex items-center justify-between mb-3">
                 <div class="card-title mb-0">"Position · PnL"</div>
                 <div class="text-xs text-zinc-500 numeric">
                     "chase " <span class="text-zinc-300">{move || chase.get()}</span>
                 </div>
             </div>
-            <div class="grid grid-cols-2 gap-3 text-xs">
-                <SidePos title="UP" qty=up_qty avg=up_avg pnl=up_pnl buy=true />
-                <SidePos title="DOWN" qty=down_qty avg=down_avg pnl=down_pnl buy=false />
+
+            <div class="position-hero">
+                <MoneyTile label="net pnl" value=net_text note=capital_note emph=true value_class=Signal::derive(move || net_value_class(net.get())) />
+                <MoneyTile label="paid" value=paid note=Signal::derive(move || "total buy cost".to_string()) emph=false value_class=Signal::derive(move || "money-value cell-ask".to_string()) />
+                <MoneyTile label="received" value=received note=Signal::derive(move || "merge / redeem cash".to_string()) emph=false value_class=Signal::derive(move || "money-value cell-bid".to_string()) />
+                <MoneyTile label="inventory" value=inv_val note=Signal::derive(move || "pairs at $1 + residual mid".to_string()) emph=false value_class=Signal::derive(move || "money-value".to_string()) />
+                <MoneyTile label="cash pnl" value=cash_pnl note=Signal::derive(move || "received - paid".to_string()) emph=false value_class=Signal::derive(move || money_value_class(snapshot.with(|s| s.as_ref().map(|s| s.position.cash_pnl).unwrap_or(0.0)))) />
+                <MoneyTile label="taker fee" value=fee note=Signal::derive(move || "Polymarket fee model".to_string()) emph=false value_class=Signal::derive(move || "money-value cell-ask".to_string()) />
+                <MoneyTile label="maker rebate" value=rebate note=Signal::derive(move || "25% fee rebate".to_string()) emph=false value_class=Signal::derive(move || "money-value cell-bid".to_string()) />
+                <MoneyTile label="merge pnl" value=merge_pnl note=Signal::derive(move || "sum pairs × (1 - avg_sum)".to_string()) emph=false value_class=Signal::derive(move || money_value_class(snapshot.with(|s| s.as_ref().map(|s| s.position.merge_pnl).unwrap_or(0.0)))) />
             </div>
-            <div class="mt-3 pt-3 border-t border-border space-y-1">
-                <Kv k="avg sum" v=avg_sum />
-                <Kv k="pending avg" v=projected />
-                <Kv k="skew" v=skew />
-                <Kv k="pending UP" v=pending_up />
-                <Kv k="pending DOWN" v=pending_down />
-                <Kv k="mergeable" v=merge_pairs />
-                <Kv k="merged" v=merged />
-                <Kv k="merge pnl" v=merge_pnl />
-            </div>
-            <div class="mt-3 pt-3 border-t border-border space-y-1">
-                <Kv k="cash pnl" v=cash_pnl />
-                <Kv k="cash flow" v=cash_flow />
-                <Kv k="inventory" v=inv_val />
-                <Kv k="fee" v=fee />
-                <Kv k="rebate" v=rebate />
-            </div>
-            <div class="mt-3 pt-3 border-t border-border space-y-1">
-                <Kv k="win UP" v=window_up />
-                <Kv k="win DOWN" v=window_down />
-                <Kv k="win cost" v=window_cost />
-                <Kv k="fill rows" v=window_rows />
-                <Kv k="rebal UP" v=rebalance_up />
-                <Kv k="rebal DOWN" v=rebalance_down />
-            </div>
-            <div class="mt-3 pt-3 border-t border-border space-y-1">
-                <Kv k="ioc orders" v=ioc_orders />
-                <Kv k="ioc fill" v=ioc_fill />
-                <Kv k="worst" v=ioc_worst />
-                <Kv k="partial" v=ioc_partial />
-                <Kv k="levels" v=ioc_levels />
-                <Kv k="chase" v=ioc_chase />
-                <Kv k="rebal" v=ioc_rebal />
-                <Kv k="last ioc" v=last_ioc />
-            </div>
-            <div class="mt-3 pt-3 border-t border-border flex items-baseline justify-between">
-                <span class="text-xs text-zinc-400 uppercase tracking-wider">"net pnl"</span>
-                <span class={move || net_class.get()}>{move || net_text.get()}</span>
+
+            <div class="position-section-grid">
+                <div class="position-subpanel">
+                    <div class="position-subtitle">"Holdings"</div>
+                    <SidePos title="UP" qty=up_qty avg=up_avg pnl=up_pnl buy=true />
+                    <SidePos title="DOWN" qty=down_qty avg=down_avg pnl=down_pnl buy=false />
+                    <Kv k="avg sum" v=avg_sum />
+                    <Kv k="pending avg" v=projected />
+                    <Kv k="skew" v=skew />
+                </div>
+                <div class="position-subpanel">
+                    <div class="position-subtitle">"Pending / Merge"</div>
+                    <Kv k="pending UP" v=pending_up />
+                    <Kv k="pending DOWN" v=pending_down />
+                    <Kv k="mergeable" v=merge_pairs />
+                    <Kv k="merged" v=merged />
+                    <Kv k="rebal UP" v=rebalance_up />
+                    <Kv k="rebal DOWN" v=rebalance_down />
+                </div>
+                <div class="position-subpanel">
+                    <div class="position-subtitle">"This Window / Fill"</div>
+                    <Kv k="win UP" v=window_up />
+                    <Kv k="win DOWN" v=window_down />
+                    <Kv k="win cost" v=window_cost />
+                    <Kv k="fill rows" v=window_rows />
+                    <Kv k="orders" v=ioc_orders />
+                    <Kv k="fill" v=ioc_fill />
+                    <Kv k="worst" v=ioc_worst />
+                    <Kv k="partial" v=ioc_partial />
+                    <Kv k="levels" v=ioc_levels />
+                    <Kv k="chase" v=ioc_chase />
+                    <Kv k="rebal" v=ioc_rebal />
+                    <Kv k="last" v=last_ioc />
+                </div>
             </div>
         </div>
+    }
+}
+
+fn money_value_class(value: f64) -> String {
+    if value > 0.0 {
+        "money-value cell-bid".to_string()
+    } else if value < 0.0 {
+        "money-value cell-ask".to_string()
+    } else {
+        "money-value".to_string()
+    }
+}
+
+fn net_value_class(value: f64) -> String {
+    if value > 0.0 {
+        "money-value cell-bid".to_string()
+    } else if value < 0.0 {
+        "money-value cell-ask".to_string()
+    } else {
+        "money-value text-zinc-200".to_string()
     }
 }
 
@@ -253,6 +281,24 @@ fn Kv(k: &'static str, v: Signal<String>) -> impl IntoView {
         <div class="kv">
             <span class="kv-key">{k}</span>
             <span class="kv-val">{move || v.get()}</span>
+        </div>
+    }
+}
+
+#[component]
+fn MoneyTile(
+    label: &'static str,
+    value: Signal<String>,
+    note: Signal<String>,
+    emph: bool,
+    value_class: Signal<String>,
+) -> impl IntoView {
+    let tile_class = if emph { "money-tile money-tile-net" } else { "money-tile" };
+    view! {
+        <div class={tile_class}>
+            <div class="money-label">{label}</div>
+            <div class={move || value_class.get()}>{move || value.get()}</div>
+            <div class="money-note">{move || note.get()}</div>
         </div>
     }
 }

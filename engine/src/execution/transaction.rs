@@ -729,7 +729,14 @@ impl OrderClient for LiveOrderClient {
         });
     }
 
-    fn tick(&self, state: &mut AppState, target_up: f64, target_down: f64, now_ms: i64) -> (bool, bool) {
+    fn tick(
+        &self,
+        state: &mut AppState,
+        target_up: f64,
+        target_down: f64,
+        _force_rebalance_taker: bool,
+        now_ms: i64,
+    ) -> (bool, bool) {
         for (side, target) in [(PositionSide::Up, target_up), (PositionSide::Down, target_down)] {
             let Some(order) = pending_order(state, side) else { continue };
             if order.status == OrderStatus::CancelRequested {

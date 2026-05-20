@@ -12,7 +12,7 @@ use crate::{
     config::AppConfig,
     execution::client::OrderClient,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
-    position::PositionSide,
+    position::{PendingOrderReason, PositionSide},
     strategy::{
         decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -89,28 +89,23 @@ const SAFETY_MARGIN: f64 = 0.05;
 /// v0.4.13 配平腿专用 margin：target = (1 - opp.avg) - REBALANCE_MARGIN
 /// 配平腿不抓 lead alpha，只锁套利空间。0.02 = 留 2c 给 fee + 滑点，余下确定净利。
 const REBALANCE_MARGIN: f64 = 0.02;
-/// Origin-compatible fill mode：挂单超过此时间未 fill → cancel。
-const MAKER_TIMEOUT_MS: i64 = 5000;
 /// Dry-run submit latency: Tokyo → Cloudflare Tokyo PoP → London CLOB backend → ack.
 /// 实测 POST /order roundtrip P50=35ms（空body）；真实下单含签名校验+撮合 P50≈45ms, P95≈60ms。
-/// 取 P50 值 — 模拟多数情况；极端尾部延迟由 queue_touch_qty 间接吸收。
+/// 取 P50 值；到达后按 FAK 重新扫当前 asks，买不到即返回 no fill。
 const SIM_SUBMIT_LATENCY_MS: i64 = 45;
-/// Dry-run cancel latency: 实测 DELETE /order roundtrip 31-34ms + 处理 ≈ 40ms。
-/// 取略高于 P50 — cancel 期间 fill 竞争窗口越短越真实，不需要过度保守。
-const SIM_CANCEL_LATENCY_MS: i64 = 45;
-/// v0.4.15 IOC walk-the-book：chase 腿允许吃簿到 target + 此滑点（cent）。
+/// Legacy execution budget placeholder: chase 腿允许吃簿到 target + 此滑点（cent）。
 /// 上限来自 CHASE_GAP_MIN(10c) - SAFETY_MARGIN(5c) = 5c 容差，砍一半给未来反弹空间。
 const CHASE_WORST_SLIPPAGE: f64 = 0.03;
-/// v0.4.15 IOC walk-the-book：配平腿 worst = (1 - opp.avg) - 此预算。
+/// Legacy execution budget placeholder: 配平腿 worst = (1 - opp.avg) - 此预算。
 /// 与 REBAL_HEALTH_MAX=0.98 严格对齐：吃完后 avg_sum < 0.98，每对 merge 至少锁 2c 利润。
 const REBAL_WORST_HEAD_ROOM: f64 = 0.02;
-/// FV 移动 ≥ 此 tick 数时视为目标已变化，IOC 评估不再走旧 target（仅观察用）。
+/// FV 移动 ≥ 此 tick 数时视为目标已变化（仅观察用）。
 const REPRICE_TICK_THRESH: f64 = 0.02;
 /// 距窗口结束 < 此分钟数时停止新建 chase 仓。
 /// v0.4.15: 0.5 → 1.5，避免末段建仓导致单边卡死。
 const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 1.5;
-/// 距窗口结束 < 此分钟数时配平腿仍允许，拯救已建仓偏仓。
-const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.5;
+/// 配平腿允许一直尝试到窗口结束，用来拯救已建偏仓；只停止新 chase。
+const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.0;
 /// Poly WS 数据新鲜度守门：距上次 poly 事件超过此毫秒则禁止建仓。
 /// 1500ms 来自 lead P95=2.4s；Poly 静默超 1.5s 说明 WS 中断或 token 未订阅，
 /// 基于陈旧 best 价走簿会打穿 worst_price 拿到错误 fill。
@@ -122,6 +117,8 @@ const MERGE_AVG_SUM_MAX: f64 = 1.0;
 /// 全量 merge 已配对部分。底层逻辑：每对 merge=$1.00，与 redeem 数学等价；
 /// 但 merge 即时锁定，避免残仓过夜的链上 gas + 时机风险。
 const FORCE_MERGE_EXPIRY_MIN: f64 = 1.0;
+/// 窗口末段强制补齐偏仓：不再等 maker 好价，按缺口数量直接 taker market 配平。
+const FORCE_TAKER_REBAL_EXPIRY_MIN: f64 = 0.25;
 
 /// IV EMA 平滑系数 α。每帧反解出的 IV 加权 α，旧值加权 (1-α)。
 /// α=0.02 ≈ 时间常数 50 帧 ≈ 5s @ 100ms/tick。让 σ 反映市场共识但不被 Binance 瞬时跳动吸收。
@@ -229,7 +226,7 @@ impl SignalEngine {
         }
     }
 
-    /// Binance BookTicker → FV 重算 + decision + IOC 执行 + 全量快照落盘
+    /// Binance BookTicker → FV 重算 + decision + execution sim + 全量快照落盘
     fn handle_book_ticker(&mut self, data: crate::model::ticker::BookTickerData) {
         if let Ok(bba) = BestBidAsk::try_from(&data) {
             let spread = bba.spread_bps();
@@ -433,10 +430,13 @@ impl SignalEngine {
 
             let now_ms = chrono::Utc::now().timestamp_millis();
             if let Ok(mut s) = self.state.write() {
+                let target_up = compute_target(&s, ChaseSide::Up, fair_p);
+                let target_down = compute_target(&s, ChaseSide::Down, fair_down);
                 let (up_fill, down_fill) = self.order_client.tick(
                     &mut s,
-                    (fair_p - SAFETY_MARGIN).max(0.0),
-                    (fair_down - SAFETY_MARGIN).max(0.0),
+                    target_up,
+                    target_down,
+                    expiry_min <= FORCE_TAKER_REBAL_EXPIRY_MIN,
                     now_ms,
                 );
                 if up_fill {
@@ -505,6 +505,7 @@ impl SignalEngine {
                 min_order_qty: MIN_ORDER_QTY,
                 min_expiry_min_for_chase: MIN_EXPIRY_MIN_FOR_CHASE,
                 min_expiry_min_for_rebal: MIN_EXPIRY_MIN_FOR_REBAL,
+                force_taker_rebal_expiry_min: FORCE_TAKER_REBAL_EXPIRY_MIN,
                 taker_buy_interval_ms: TAKER_BUY_INTERVAL_MS,
                 force_balance_slack: FORCE_BALANCE_SLACK,
                 chase_only_in_excited: CHASE_ONLY_IN_EXCITED,
@@ -673,11 +674,16 @@ impl SignalEngine {
 
             // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
             let ts_ms = chrono::Utc::now().timestamp_millis();
-            let target_up = (s.fair_price - SAFETY_MARGIN).max(0.0);
-            let target_down = (s.fair_price_down - SAFETY_MARGIN).max(0.0);
-            let (up_fill, down_fill) = self
-                .order_client
-                .tick(&mut s, target_up, target_down, ts_ms);
+            let target_up = compute_target(&s, ChaseSide::Up, s.fair_price);
+            let target_down = compute_target(&s, ChaseSide::Down, s.fair_price_down);
+            let force_rebalance_taker = s.expiry_minutes <= FORCE_TAKER_REBAL_EXPIRY_MIN;
+            let (up_fill, down_fill) = self.order_client.tick(
+                &mut s,
+                target_up,
+                target_down,
+                force_rebalance_taker,
+                ts_ms,
+            );
             if up_fill {
                 self.last_taker_up_ts_ms = ts_ms;
             }
@@ -737,5 +743,27 @@ impl SignalEngine {
         if let Some((win, row)) = fv_snap_pending {
             self.fv_snapshot_writer.push(win, row);
         }
+    }
+}
+
+/// 配平腿目标价 = (1 - 对侧 avg) - REBALANCE_MARGIN；其它单 = fair - SAFETY_MARGIN。
+fn compute_target(s: &AppState, side: ChaseSide, fair: f64) -> f64 {
+    let (pending, opp_avg) = match side {
+        PositionSide::Up => (
+            s.ledger.maker_buy_intent_up.as_ref(),
+            s.ledger.position_down.avg_price,
+        ),
+        PositionSide::Down => (
+            s.ledger.maker_buy_intent_down.as_ref(),
+            s.ledger.position_up.avg_price,
+        ),
+    };
+    let is_rebal = pending
+        .map(|o| o.reason == PendingOrderReason::Rebalance)
+        .unwrap_or(false);
+    if is_rebal && opp_avg > 0.0 {
+        (1.0 - opp_avg - REBALANCE_MARGIN).max(0.0)
+    } else {
+        (fair - SAFETY_MARGIN).max(0.0)
     }
 }

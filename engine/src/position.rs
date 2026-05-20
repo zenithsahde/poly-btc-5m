@@ -92,13 +92,13 @@ pub struct ManagedOrder {
     pub maker_taker: bool, // true=maker, false=taker
     /// 策略目标价（chase = FV - safety，rebal = 同侧 target），用于和 worst_price 对比评估滑点预算。
     pub target_price: f64,
-    /// IOC 硬上限价（chase = target+slippage, rebal = (1-opp.avg)-headroom）。
+    /// Execution limit price used by taker FAK and one-shot maker probes.
     pub price: f64,
     pub qty: f64,
     pub filled_qty: f64,
     /// fill 累计 notional = Σ(price_i × qty_i)，配合 filled_qty 算 VWAP
     pub filled_notional: f64,
-    /// IOC 实际吃到的盘口档数；0 表示未成交，1 表示只吃 best ask。
+    /// 实际吃到的盘口档数；0 表示未成交，1 表示只吃 best ask。
     pub fill_levels: u32,
     pub placed_ts_ms: i64,
     pub updated_ts_ms: i64,
@@ -107,6 +107,8 @@ pub struct ManagedOrder {
     pub reason: PendingOrderReason,
     pub status: OrderStatus,
     pub reject_reason: Option<String>,
+    /// net_pnl snapshot at the moment this order was last updated (fill/cancel/reject).
+    pub snapshot_pnl: f64,
 }
 
 impl ManagedOrder {
@@ -138,6 +140,7 @@ impl ManagedOrder {
             reason,
             status: OrderStatus::Created,
             reject_reason: None,
+            snapshot_pnl: 0.0,
         }
     }
 
@@ -180,7 +183,7 @@ impl ManagedOrder {
         self.updated_ts_ms = ts_ms;
     }
 
-    /// IOC walk-the-book 调用：记录某档 fill 的实际成交价，累计 notional 用于 VWAP
+    /// 记录某档 fill 的实际成交价，累计 notional 用于 VWAP
     pub fn record_fill_at(&mut self, fill_qty: f64, fill_price: f64, ts_ms: i64) {
         self.filled_notional += fill_qty * fill_price;
         self.fill_levels = self.fill_levels.saturating_add(1);
@@ -213,6 +216,8 @@ pub struct TradeRecord {
     pub down_ask: f64,
     pub down_bid: f64,
     pub down_spread: f64,
+    /// net_pnl snapshot at the moment this fill occurred.
+    pub snapshot_pnl: f64,
 }
 
 /// 单侧仓位（数量 + 持仓均价）
@@ -510,6 +515,7 @@ impl PositionLedger {
             down_ask,
             down_bid,
             down_spread: (down_ask - down_bid).max(0.0),
+            snapshot_pnl: 0.0, // caller (AppState::apply_fill) stamps the real value after
         });
     }
 

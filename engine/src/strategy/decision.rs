@@ -47,6 +47,7 @@ pub struct Thresholds {
     pub min_order_qty: f64,
     pub min_expiry_min_for_chase: f64,
     pub min_expiry_min_for_rebal: f64,
+    pub force_taker_rebal_expiry_min: f64,
     pub taker_buy_interval_ms: i64,
     pub force_balance_slack: f64,
     pub chase_only_in_excited: bool,
@@ -59,6 +60,7 @@ pub struct BuyIntent {
     pub target: f64,
     pub worst: f64,
     pub reason: PendingOrderReason,
+    pub force_taker: bool,
     /// 当前决策帧的展示值（供 TUI 用），不影响执行
     pub rebalance_hint: Option<(f64, f64)>,
 }
@@ -82,6 +84,7 @@ pub fn build_intents(
     let in_excited = !snap.steady;
     let in_chase_window = snap.expiry_min >= th.min_expiry_min_for_chase;
     let in_rebal_window = snap.expiry_min >= th.min_expiry_min_for_rebal;
+    let force_taker_rebal = snap.expiry_min <= th.force_taker_rebal_expiry_min;
 
     // lead 信号：FV 显著高于 Poly 且正在上涨
     let up_chase = th.chase_only_in_excited
@@ -147,12 +150,16 @@ pub fn build_intents(
     let trigger_down = chase_buy_down || rebalance_buy_down_path;
 
     // origin/main：chase 与 rebalance 都按固定策略量下单；小偏仓也不裁剪为缺口量。
-    let order_qty_up = if chase_buy_up || rebalance_buy_up_path {
+    let order_qty_up = if rebalance_buy_up_path && force_taker_rebal {
+        rebalance_qty_up
+    } else if chase_buy_up || rebalance_buy_up_path {
         th.chase_min_qty
     } else {
         0.0
     };
-    let order_qty_down = if chase_buy_down || rebalance_buy_down_path {
+    let order_qty_down = if rebalance_buy_down_path && force_taker_rebal {
+        rebalance_qty_down
+    } else if chase_buy_down || rebalance_buy_down_path {
         th.chase_min_qty
     } else {
         0.0
@@ -187,12 +194,42 @@ pub fn build_intents(
         (opp_proxy + new_avg_down_after) < th.pair_health_max
     };
 
-    let target_up = (fv.fair_up - th.safety_margin).max(0.0);
-    let target_down = (fv.fair_down - th.safety_margin).max(0.0);
-    let want_buy_up =
-        trigger_up && pair_health_ok_up && target_up > 0.0 && target_up <= th.max_buy_price;
-    let want_buy_down =
-        trigger_down && pair_health_ok_down && target_down > 0.0 && target_down <= th.max_buy_price;
+    let chase_target_up = (fv.fair_up - th.safety_margin).max(0.0);
+    let chase_target_down = (fv.fair_down - th.safety_margin).max(0.0);
+    let rebal_target_up = if snap.avg_down > 0.0 {
+        (1.0 - snap.avg_down - th.rebal_worst_head_room).max(0.0)
+    } else {
+        chase_target_up
+    };
+    let rebal_target_down = if snap.avg_up > 0.0 {
+        (1.0 - snap.avg_up - th.rebal_worst_head_room).max(0.0)
+    } else {
+        chase_target_down
+    };
+    let target_up = if rebalance_buy_up_path && force_taker_rebal {
+        1.0
+    } else if rebalance_buy_up_path && !chase_buy_up {
+        rebal_target_up
+    } else {
+        chase_target_up
+    };
+    let target_down = if rebalance_buy_down_path && force_taker_rebal {
+        1.0
+    } else if rebalance_buy_down_path && !chase_buy_down {
+        rebal_target_down
+    } else {
+        chase_target_down
+    };
+    let force_buy_up =
+        rebalance_buy_up_path && force_taker_rebal && order_qty_up >= th.min_order_qty;
+    let force_buy_down =
+        rebalance_buy_down_path && force_taker_rebal && order_qty_down >= th.min_order_qty;
+    let want_buy_up = trigger_up
+        && target_up > 0.0
+        && (force_buy_up || (pair_health_ok_up && target_up <= th.max_buy_price));
+    let want_buy_down = trigger_down
+        && target_down > 0.0
+        && (force_buy_down || (pair_health_ok_down && target_down <= th.max_buy_price));
 
     let mut intents: Vec<BuyIntent> = Vec::with_capacity(2);
     if want_buy_up {
@@ -207,6 +244,7 @@ pub fn build_intents(
             target: target_up,
             worst: target_up,
             reason,
+            force_taker: force_buy_up,
             rebalance_hint: None,
         });
     }
@@ -222,6 +260,7 @@ pub fn build_intents(
             target: target_down,
             worst: target_down,
             reason,
+            force_taker: force_buy_down,
             rebalance_hint: None,
         });
     }
@@ -248,5 +287,97 @@ fn weighted_avg(old_qty: f64, old_avg: f64, add_qty: f64, add_price: f64) -> f64
         (old_avg * old_qty + add_price * add_qty) / total
     } else {
         add_price
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thresholds() -> Thresholds {
+        Thresholds {
+            chase_gap_min: 0.10,
+            safety_margin: 0.05,
+            chase_worst_slippage: 0.03,
+            rebal_worst_head_room: 0.02,
+            pair_health_max: 1.05,
+            rebal_health_max: 0.98,
+            max_buy_price: 0.85,
+            chase_min_qty: 100.0,
+            min_order_qty: 1.0,
+            min_expiry_min_for_chase: 1.5,
+            min_expiry_min_for_rebal: 0.0,
+            force_taker_rebal_expiry_min: 0.25,
+            taker_buy_interval_ms: 1000,
+            force_balance_slack: 0.0,
+            chase_only_in_excited: true,
+        }
+    }
+
+    fn fv() -> FvResult {
+        FvResult {
+            fair_up: 0.40,
+            fair_down: 0.50,
+            sigma: 0.0,
+            sigma_used_default: false,
+            sigma_source: "test",
+            new_sticky: 0.0,
+            iv_raw: 0.0,
+            iv_poly: 0.0,
+            fv_up_rising: false,
+            fv_down_rising: false,
+        }
+    }
+
+    #[test]
+    fn rebalance_still_triggers_at_window_end_for_open_skew() {
+        let snap = MarketSnapshot {
+            poly_up_mid: 0.38,
+            poly_down_mid: 0.44,
+            up_ask: 0.39,
+            down_ask: 0.44,
+            qty_up: 30.0,
+            qty_down: 0.0,
+            avg_up: 0.375,
+            avg_down: 0.0,
+            steady: true,
+            expiry_min: 0.0,
+            poly_fresh: true,
+        };
+
+        let (intents, effects) = build_intents(&fv(), &snap, &thresholds(), 10_000, 0, 0);
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].side, ChaseSide::Down);
+        assert_eq!(intents[0].reason, PendingOrderReason::Rebalance);
+        assert_eq!(intents[0].qty, 30.0);
+        assert!(intents[0].force_taker);
+        assert!(effects.rebalance_hint_down.is_some());
+    }
+
+    #[test]
+    fn forced_rebalance_uses_exact_missing_qty_and_market_limit() {
+        let snap = MarketSnapshot {
+            poly_up_mid: 0.38,
+            poly_down_mid: 0.44,
+            up_ask: 0.39,
+            down_ask: 0.99,
+            qty_up: 29.93,
+            qty_down: 0.0,
+            avg_up: 0.375,
+            avg_down: 0.0,
+            steady: true,
+            expiry_min: 0.1,
+            poly_fresh: true,
+        };
+
+        let (intents, _) = build_intents(&fv(), &snap, &thresholds(), 10_000, 0, 0);
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].side, ChaseSide::Down);
+        assert_eq!(intents[0].reason, PendingOrderReason::Rebalance);
+        assert!(intents[0].force_taker);
+        assert!((intents[0].qty - 29.93).abs() < 0.0001);
+        assert_eq!(intents[0].target, 1.0);
     }
 }

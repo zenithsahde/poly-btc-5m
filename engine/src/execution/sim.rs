@@ -2,15 +2,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::execution::client::{OrderClient, PlaceOrderRequest, PlaceOrderResult};
-use crate::position::{ManagedOrder, OrderStatus, PositionSide};
+use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason, PositionSide};
 use crate::strategy::decision::BuyIntent;
 use crate::tui::app::{AppState, BookLevel, ChaseSide};
 
 /// Deterministic dry-run execution model.
 ///
-/// Strategy remains origin/main-compatible: it emits buy intents with the same target, qty,
-/// reason, and ordering. This simulator owns the non-strategy realism: REST submit delay,
-/// maker queue position, FAK-style taker fills, cancel latency, and cancel/fill races.
+/// 模拟 REST 提交延迟 / maker 队列位 / FAK-style taker / 撤单延迟 / 撤单与成交竞速。
+/// 配平腿默认走 maker（不付 spread），窗口末段强制 force-taker 收尾。
 #[derive(Clone, Debug)]
 pub struct ExecutionSim {
     submit_latency_ms: i64,
@@ -31,9 +30,6 @@ impl ExecutionSim {
             submit_latency_ms,
             cancel_latency_ms,
             maker_timeout_ms,
-            // Realistic-conservative queue proxy: one qualifying touch consumes roughly one
-            // strategy clip ahead of us. It still prevents instant maker fills, but avoids
-            // making thin 5m books effectively unfillable.
             queue_touch_qty: 100.0,
         }
     }
@@ -45,6 +41,8 @@ impl ExecutionSim {
 
         let ask = best_ask(s, intent.side);
         let marketable_on_decision = ask > 0.0 && ask <= intent.target;
+        // 配平腿默认 maker，省 spread；force_taker 由策略决定（窗口末段 / chase）。
+        let prefer_maker = intent.reason == PendingOrderReason::Rebalance && !intent.force_taker;
         let mut order = s.ledger.create_managed_buy_order(
             intent.side,
             intent.target,
@@ -54,7 +52,7 @@ impl ExecutionSim {
         );
         order.target_price = intent.target;
         order.price = intent.target;
-        order.maker_taker = !marketable_on_decision;
+        order.maker_taker = prefer_maker || (!intent.force_taker && !marketable_on_decision);
         order.status = OrderStatus::Submitted;
         order.exchange_arrive_ts_ms = now_ms + self.submit_latency_ms;
         order.updated_ts_ms = now_ms;
@@ -67,11 +65,12 @@ impl ExecutionSim {
         s: &mut AppState,
         target_up: f64,
         target_down: f64,
+        force_rebalance_taker: bool,
         now_ms: i64,
     ) -> SimFills {
         SimFills {
-            up: self.process_side(s, ChaseSide::Up, target_up, now_ms),
-            down: self.process_side(s, ChaseSide::Down, target_down, now_ms),
+            up: self.process_side(s, ChaseSide::Up, target_up, force_rebalance_taker, now_ms),
+            down: self.process_side(s, ChaseSide::Down, target_down, force_rebalance_taker, now_ms),
         }
     }
 
@@ -80,11 +79,25 @@ impl ExecutionSim {
         s: &mut AppState,
         side: ChaseSide,
         current_target: f64,
+        force_rebalance_taker: bool,
         now_ms: i64,
     ) -> bool {
         let Some(mut order) = take_pending_order(s, side) else {
             return false;
         };
+
+        // 窗口末段：把仍挂着的 maker 配平单强制转 taker market（exact missing qty）。
+        if force_rebalance_taker
+            && order.maker_taker
+            && order.reason == PendingOrderReason::Rebalance
+        {
+            order.maker_taker = false;
+            order.price = 1.0;
+            order.target_price = 1.0;
+            order.status = OrderStatus::Submitted;
+            order.exchange_arrive_ts_ms = now_ms;
+            order.updated_ts_ms = now_ms;
+        }
 
         if matches!(order.status, OrderStatus::Submitted | OrderStatus::Created) {
             if now_ms < order.exchange_arrive_ts_ms {
@@ -126,7 +139,23 @@ impl ExecutionSim {
             return false;
         }
 
-        if current_target > 0.0 && (current_target - order.price).abs() >= 0.02 {
+        // 配平腿改价不撤单；其它单 reprice 容忍 2 cent。
+        let reprice_thresh = if order.reason == PendingOrderReason::Rebalance {
+            0.01
+        } else {
+            0.02
+        };
+        if current_target > 0.0 && (current_target - order.price).abs() >= reprice_thresh {
+            if order.reason == PendingOrderReason::Rebalance {
+                order.target_price = current_target;
+                order.price = current_target;
+                order.status = OrderStatus::Submitted;
+                order.exchange_arrive_ts_ms = now_ms + self.submit_latency_ms;
+                order.updated_ts_ms = now_ms;
+                order.queue_ahead_qty = 0.0;
+                set_pending_order(s, side, Some(order));
+                return false;
+            }
             order.mark_cancel_requested(now_ms);
             order.reject_reason = Some("reprice".to_string());
             set_pending_order(s, side, Some(order));
@@ -329,9 +358,10 @@ impl OrderClient for ExecutionSim {
         state: &mut AppState,
         target_up: f64,
         target_down: f64,
+        force_rebalance_taker: bool,
         now_ms: i64,
     ) -> (bool, bool) {
-        let fills = self.process(state, target_up, target_down, now_ms);
+        let fills = self.process(state, target_up, target_down, force_rebalance_taker, now_ms);
         (fills.up, fills.down)
     }
 }

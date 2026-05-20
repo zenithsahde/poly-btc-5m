@@ -53,11 +53,13 @@ pub trait OrderClient: Send + Sync {
     );
 
     // (up_filled, down_filled)：干跑由 ExecutionSim 推进；实盘恒 (false, false)。
+    // force_rebalance_taker：窗口末段对配平腿强制 taker 化（dry-run 用；实盘忽略）。
     fn tick(
         &self,
         state: &mut AppState,
         target_up: f64,
         target_down: f64,
+        force_rebalance_taker: bool,
         now_ms: i64,
     ) -> (bool, bool);
 
