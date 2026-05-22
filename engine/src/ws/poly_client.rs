@@ -11,10 +11,12 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 
+use crate::execution::client::OrderClient;
 use crate::tui::app::{AppState, BookLevel};
 use crate::ws::discovery::{Active5mMarket, MarketDiscovery};
 use crate::ws::reconnect::ReconnectPolicy;
 use crate::ws::stream::{MarketEvent, PolyBookData};
+use alloy_primitives::B256;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const PING_INTERVAL_SECS: u64 = 10;
@@ -37,6 +39,8 @@ struct PolyMarketState {
     down_token_id: String,
     slug: String,
     window_end_ts: i64,
+    /// 当前 5m 市场的 CTF conditionId，窗口结束时 merge 用。
+    condition_id: B256,
     next_market: Option<Active5mMarket>,
 }
 
@@ -46,6 +50,7 @@ pub struct PolyWsClient {
     state: Arc<std::sync::RwLock<AppState>>,
     rest_endpoint: String,
     symbol: String,
+    order_client: Arc<dyn OrderClient>,
 }
 
 impl PolyWsClient {
@@ -55,12 +60,14 @@ impl PolyWsClient {
         state: Arc<std::sync::RwLock<AppState>>,
         rest_endpoint: String,
         symbol: String,
+        order_client: Arc<dyn OrderClient>,
     ) -> Self {
         let market = Arc::new(RwLock::new(PolyMarketState {
             up_token_id: initial.up_token_id.clone(),
             down_token_id: initial.down_token_id.clone(),
             slug: initial.slug.clone(),
             window_end_ts: initial.window_end_ts,
+            condition_id: initial.condition_id,
             next_market: None,
         }));
         if let Ok(mut s) = state.write() {
@@ -75,6 +82,7 @@ impl PolyWsClient {
             state,
             rest_endpoint,
             symbol,
+            order_client,
         }
     }
 
@@ -273,6 +281,8 @@ impl PolyWsClient {
             }
         };
 
+        let old_condition_id = self.market.read().await.condition_id;
+
         // 只更新内存状态并清空订单簿，不在此连接上 unsubscribe/subscribe（服务端同连接换订往往不重推 book）
         {
             let mut m = self.market.write().await;
@@ -280,7 +290,31 @@ impl PolyWsClient {
             m.down_token_id = new_market.down_token_id.clone();
             m.slug = new_market.slug.clone();
             m.window_end_ts = new_market.window_end_ts;
+            m.condition_id = new_market.condition_id;
         }
+
+        // merge 在写锁之外 await，成功后再进锁 apply_merge；失败保留持仓由下个窗口重试
+        let pair_qty = self
+            .state
+            .read()
+            .ok()
+            .map(|s| s.ledger.mergeable_pairs())
+            .unwrap_or(0.0);
+        let merge_outcome = if pair_qty > 0.0 && old_condition_id != B256::ZERO {
+            match self.order_client.merge_pairs(old_condition_id, pair_qty).await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    warn!(pair_qty, error = %e, "窗口收盘 merge 失败");
+                    None
+                }
+            }
+        } else {
+            if pair_qty > 0.0 && old_condition_id == B256::ZERO {
+                warn!(pair_qty, "旧窗口 conditionId 缺失，跳过 merge");
+            }
+            None
+        };
+
         // 行权价 K（v0.5.0 对齐 Polymarket 实际结算源）：
         //   优先：chainlink REST get_report_at(window_start_ts) — Polymarket gamma API
         //         的 resolutionSource 明确指向 chainlink BTC/USD data stream
@@ -319,6 +353,19 @@ impl PolyWsClient {
             // v0.5.0: 结算价改用 chainlink_price（Polymarket 实际结算源），fallback 到 binance mid
             //   chainlink 缺失或未启用时回退到 binance（与改造前完全等价，不会变差）
             let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Some(outcome) = merge_outcome {
+                s.ledger.apply_merge(outcome.pair_qty, now_ms);
+                if outcome.tx_hash != B256::ZERO {
+                    s.ledger.last_merge_tx_hash =
+                        Some(format!("0x{}", hex::encode(outcome.tx_hash.as_slice())));
+                    info!(
+                        tx_hash = %outcome.tx_hash,
+                        pair_qty = outcome.pair_qty,
+                        elapsed_ms = outcome.elapsed_ms,
+                        "窗口收盘 merge 已上链"
+                    );
+                }
+            }
             let close_price = s.chainlink_price.unwrap_or(s.mid_price);
             s.settle_window_and_redeem(close_price, now_ms);
             s.reset_inventory_for_new_window();

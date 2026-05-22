@@ -42,6 +42,7 @@ use cli::{Cli, Mode};
 use config::AppConfig;
 use execution::balance::BalanceProvider;
 use execution::client::OrderClient;
+use execution::merge::build_merge_client;
 use execution::sim::ExecutionSim;
 use execution::signer::{parse_builder_code, PolySigner};
 use execution::transaction::{build_http2_client, derive_api_key, ApiCreds, LiveOrderClient};
@@ -128,7 +129,16 @@ async fn main() -> Result<()> {
 
         warn!("Live 模式：无 WS fill listener，GTC 挂单成交不会回流 PnL；先用小额 order_size_usdc 验。");
 
-        let live = LiveOrderClient::with_http(
+        // 构造 MergeClient 用一份独立的 PolySigner 实例（LiveOrderClient 会消费其参数）
+        let merge_signer = PolySigner::new(pk, signature_mode, wallet_address, builder_code)?;
+        let merge_client = build_merge_client(
+            Arc::new(merge_signer),
+            creds.clone(),
+            rpc_url,
+            http.clone(),
+        )?;
+
+        let mut live = LiveOrderClient::with_http(
             signer,
             creds,
             cfg.trading.order_size_usdc,
@@ -137,6 +147,7 @@ async fn main() -> Result<()> {
             http,
         )
         .await?;
+        live.attach_merge_client(Arc::new(merge_client));
         Arc::new(live)
     } else {
         if cli.dry_run {
@@ -215,6 +226,7 @@ async fn main() -> Result<()> {
                     up_token_id: cfg.trading.poly_token_id.clone(),
                     down_token_id: String::new(),
                     slug: "unknown".to_string(),
+                    condition_id: alloy_primitives::B256::ZERO,
                     window_end_ts: 0,
                 }
             }
@@ -226,6 +238,7 @@ async fn main() -> Result<()> {
             up_token_id: cfg.trading.poly_token_id.clone(),
             down_token_id: String::new(),
             slug: format!("btc-updown-5m-{}", window_start),
+            condition_id: alloy_primitives::B256::ZERO,
             window_end_ts: window_start + 300,
         }
     };
@@ -261,6 +274,7 @@ async fn main() -> Result<()> {
         Arc::clone(&state),
         cfg.exchange.rest_endpoint.clone(),
         cfg.trading.symbol.clone(),
+        Arc::clone(&order_client),
     );
     let poly_task = tokio::spawn(async move {
         let _ = poly_client.run().await;
