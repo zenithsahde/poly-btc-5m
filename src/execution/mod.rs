@@ -1,5 +1,6 @@
 /// execution/mod.rs - 执行层入口
 pub mod balance;
+pub mod circuit_breaker;
 pub mod client;
 pub mod gateway;
 pub mod merge;

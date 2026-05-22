@@ -37,6 +37,7 @@ use clap::Parser;
 use cli::Cli;
 use config::AppConfig;
 use execution::balance::BalanceProvider;
+use execution::circuit_breaker::CircuitBreaker;
 use execution::client::OrderClient;
 use execution::merge::build_merge_client;
 use execution::signer::{parse_builder_code, PolySigner};
@@ -156,6 +157,15 @@ async fn main() -> Result<()> {
                 http.clone(),
             )?;
 
+            let cb_cfg = cfg.circuit_breaker.clone().unwrap_or_default();
+            info!(
+                enabled = cb_cfg.enabled,
+                max_daily_loss = cb_cfg.max_daily_loss,
+                max_consecutive_errors = cb_cfg.max_consecutive_errors,
+                "circuit breaker armed (live only)"
+            );
+            let circuit_breaker = Arc::new(CircuitBreaker::new(cb_cfg));
+
             let mut live = LiveOrderClient::with_http(
                 signer,
                 creds,
@@ -164,6 +174,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&state),
                 http,
                 db_tx.clone(),
+                Arc::clone(&circuit_breaker),
             )
             .await?;
             live.attach_merge_client(Arc::new(merge_client));

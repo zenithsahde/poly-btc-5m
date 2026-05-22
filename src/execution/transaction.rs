@@ -13,6 +13,7 @@ use serde_json::json;
 use sha2::Sha256;
 use tracing::{debug, info, warn};
 
+use crate::execution::circuit_breaker::CircuitBreaker;
 use crate::execution::client::{
     BuyIntent, OrderClient, OrderSide, OrderType, PlaceOrderRequest, PlaceOrderResult,
 };
@@ -207,6 +208,7 @@ pub struct SharedClob {
     pub resubmit_tx: Option<ResubmitSender>,
     pub post_template: reqwest::Request,
     pub signer: Arc<PolySigner>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl SharedClob {
@@ -261,6 +263,7 @@ impl LiveOrderClient {
         maker_timeout_ms: i64,
         state: Arc<RwLock<AppState>>,
         db_tx: DbSender,
+        circuit_breaker: Arc<CircuitBreaker>,
     ) -> Result<Self> {
         Self::with_http(
             signer,
@@ -270,6 +273,7 @@ impl LiveOrderClient {
             state,
             build_http2_client()?,
             db_tx,
+            circuit_breaker,
         )
         .await
     }
@@ -282,6 +286,7 @@ impl LiveOrderClient {
         state: Arc<RwLock<AppState>>,
         http: Client,
         db_tx: DbSender,
+        circuit_breaker: Arc<CircuitBreaker>,
     ) -> Result<Self> {
         let wallet = signer.maker().to_checksum(None);
         let post_template = build_request_template(ORDER_URL, &wallet, &creds, Method::POST)?;
@@ -312,6 +317,7 @@ impl LiveOrderClient {
                 resubmit_tx: None,
                 post_template,
                 signer: Arc::new(signer),
+                circuit_breaker,
             }),
             delete_template,
             merge_client: None,
@@ -631,6 +637,11 @@ impl OrderClient for LiveOrderClient {
         {
             return;
         }
+        let cash_pnl = state.cash_pnl();
+        if let Err(reason) = self.shared.circuit_breaker.check(cash_pnl) {
+            warn!(side = ?intent.side, %reason, "circuit breaker blocks dispatch_buy_intent");
+            return;
+        }
         let marketable = best_ask > 0.0 && best_ask <= intent.target;
         let order_type = if marketable { OrderType::Fak } else { OrderType::Gtc };
         let size_shares = self.shared.order_size_usdc / intent.target;
@@ -689,6 +700,7 @@ impl OrderClient for LiveOrderClient {
                             }
                         }
                         info!(?side, order_id = %resp.order_id, status = %resp.status, taking, "POST /order ok");
+                        shared.circuit_breaker.record_success();
                     } else {
                         if let Ok(mut s) = shared.state.write() {
                             let ours = pending_order(&s, side)
@@ -707,6 +719,7 @@ impl OrderClient for LiveOrderClient {
                             }
                         }
                         warn!(?side, status = %resp.status, error = ?resp.error_msg, "POST /order rejected");
+                        shared.circuit_breaker.record_error();
                     }
 
                     // 3. Resubmit 判定（200 部分成交 / 400 失败）
@@ -725,6 +738,7 @@ impl OrderClient for LiveOrderClient {
                         }
                     }
                     warn!(?side, error = %e, "POST /order transport failed (no DB row written)");
+                    shared.circuit_breaker.record_error();
                 }
             }
         });

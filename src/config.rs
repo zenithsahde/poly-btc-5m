@@ -1,8 +1,11 @@
 /// config.rs - 配置加载模块
-/// 从 config/default.toml + 环境变量中加载配置
+/// 从根目录 config.toml + 环境变量中加载配置
+/// 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
 use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
+
+pub use crate::execution::circuit_breaker::CircuitBreakerConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExchangeConfig {
@@ -95,14 +98,16 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub wallet: Option<WalletConfig>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        // 配置加载优先级：default.toml < 环境变量
+        // 配置加载优先级：根目录 config.toml < 环境变量
         // 环境变量格式：APP__TRADING__SYMBOL=ETHUSDT（双下划线分隔层级）
         let config = Config::builder()
-            .add_source(File::with_name("config/default"))
+            .add_source(File::with_name("config"))
             .add_source(
                 Environment::with_prefix("APP")
                     .separator("__")

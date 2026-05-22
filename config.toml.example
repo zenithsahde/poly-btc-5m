@@ -1,5 +1,9 @@
 # ──────────────────────────────────────────────
-# SJ Trading Engine - 默认配置
+# SJ Trading Engine - 配置模板
+# 用法：cp config.toml.example config.toml 后填写实盘密钥
+# 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
+#   e.g. APP__CIRCUIT_BREAKER__MAX_DAILY_LOSS=20
+# 注意：根目录 config.toml 已在 .gitignore，请勿提交私钥。
 # ──────────────────────────────────────────────
 
 [exchange]
@@ -15,7 +19,7 @@ rest_endpoint = "https://api.binance.com"
 symbol = "BTCUSDT"
 # 订阅的数据流
 streams = ["bookTicker", "depth@100ms", "aggTrade"]
-# Polymarket BTC Price (Yes) Token ID
+# Polymarket BTC Price (Yes) Token ID（每个 5m 窗口对应不同 token）
 poly_token_id = ""
 # 5m 公允价：行权价 K（未从 Poly 解析时使用）
 strike_price = 96000.0
@@ -26,44 +30,46 @@ volatility_sigma_min = 0.1
 volatility_sigma_max = 2.0
 # 稳态下 Poly IV 的 σ 上限（用 Poly 反解时允许更高，使 FV 贴近盘口）
 volatility_sigma_max_poly = 5.0
-# 每笔 BuyIntent 的下单名义额（USDC）；必填，无代码默认。qty_shares = order_size_usdc / target
+# 每笔 BuyIntent 的下单名义额（USDC）；qty_shares = order_size_usdc / target_price
 order_size_usdc = 100.0
 
 [websocket]
-# 心跳间隔（秒）
 ping_interval_secs = 20
-# Pong 超时（秒）
 pong_timeout_secs = 10
-# 断线重连：初始等待（毫秒）
 reconnect_base_ms = 1000
-# 断线重连：最大等待（毫秒）
 reconnect_max_ms = 30000
 
 [latency]
-# 延迟告警阈值（毫秒）- 超过此值打印 WARN 日志
 warn_threshold_ms = 10
-# 统计打印间隔（秒）
 report_interval_secs = 10
 
 [orderbook]
-# 维护的订单簿深度（买卖各多少档）
 depth_levels = 20
 
 [api]
-# 从环境变量读取，不写在配置文件里
-# BINANCE_API_KEY=xxx
-# BINANCE_SECRET_KEY=xxx
+# 推荐用环境变量注入：BINANCE_API_KEY=xxx / BINANCE_SECRET_KEY=xxx
 api_key = ""
 secret_key = ""
 
 [logging]
-# 日志级别：trace / debug / info / warn / error
+# trace / debug / info / warn / error
 level = "info"
 
+[circuit_breaker]
+# 自动熔断：cash_pnl 亏损或连续下单错误超阈值后，永久阻止 LiveOrderClient 继续下单
+# （需重启进程恢复）。仅作用于实盘；dry-run/ExecutionSim 不受影响。
+enabled = true
+# 当日已实现 cash_pnl 亏损超过该 USDC 数额即熔断
+max_daily_loss = 50.0
+# 连续下单错误次数（rejected / transport failed）达到该值即熔断
+max_consecutive_errors = 5
+
 [wallet]
-# 钱包类型: eoa | safe | deposit_wallet
+# 钱包类型：eoa | safe | deposit_wallet
 signature_mode = "safe"
+# Polymarket 上的 funder 地址（safe / proxy）；EOA 模式下为 signer 地址本身
 wallet_address = "0x0000000000000000000000000000000000000000"
+# 实盘私钥（hex，0x 前缀）；留空 = dry-run 模式
 private_key = ""
 # 32-byte hex (0x-prefixed)；留空字符串视为 zero builder
 builder_code = ""

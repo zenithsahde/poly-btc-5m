@@ -1,54 +1,120 @@
-# Latency Arbitrage Engine (FV)
+# poly-btc-5m
 
-Binance WebSocket + Polymarket 5m 做市引擎：基于公允价（Fair Value）与稳态/激变态的被动追涨与配平逻辑，带 TUI 与模拟成交落盘。
+Binance 行情驱动的 Polymarket BTC 5 分钟二元市场做市 / 套利引擎。基于公允价（Black-Scholes）与稳态 / 激变态切换的被动追涨与配平逻辑，已接入 Polymarket 实盘下单（CLOB POST /order + Safe / EOA 签名 + User-Channel WSS + 收盘 on-chain merge），TUI 与 Leptos Web 双前端。
 
-## 功能概览
-
-- **数据**：币安 BookTicker / Depth / AggTrade，Polymarket 5 分钟 Up-Down 订单簿
-- **公允价**：BS 模型 + 行权价 K、到期 T、波动率 σ（稳态用 Poly 反解 IV，激变态用粘性/默认 σ）
-- **稳态 / 激变态**：币安 5s/1s 波动判定；激变态下停用 Poly 反解、启用激变态快照与领先延迟统计
-- **追涨**：仅在**激变态**下挂 Maker 买（FV 领先 Poly、上涨判定）；稳态不追涨
-- **配平**：偏仓侧挂 Maker 买意图，全配平价后均价之和 < 1 才允许挂
-- **成交**：Maker 买模拟成交（best_ask ≤ 挂单价），换 5m 窗口时落盘 `trades/trades_{window_end_ts}.csv`，保留最新 10 份
-
-## 构建与运行
+## 快速开始
 
 ```bash
+# 1. 准备配置（含私钥的本地配置不入 git）
+cp config.toml.example config.toml
+$EDITOR config.toml    # 至少填 trading.poly_token_id；实盘还需 wallet.*
+
+# 2. 编译
 cargo build --release
-cargo run --release
+
+# 3. 运行（默认 TUI 渲染；按 q 或 Ctrl+C 退出）
+cargo run --release                # 实盘（若 wallet.private_key 已填）
+cargo run --release -- --dry-run   # 强制 dry-run（模拟撮合）
 ```
 
-默认读取 `config/default.toml`，可通过环境变量或 `CONFIG` 指定其它配置文件。
+启动时 TUI 顶部会显示 `LIVE` / `DRY-RUN` 指示器。
 
-## 配置要点
+## CLI 参数
 
-- `[trading]`：`symbol`（如 BTCUSDT）、`poly_token_id`、`wallet_address`、`strike_price`、波动率默认与裁剪
-- `[exchange]`：币安 WS/REST 端点
-- `[orderbook]`：`depth_levels`（订单簿档位）
+| 参数         | 说明                                                          |
+|--------------|---------------------------------------------------------------|
+| `--dry-run`  | 强制使用 ExecutionSim，即使 `[wallet].private_key` 已配置也忽略 |
 
-详见 `config/default.toml`。
+## 环境变量
+
+| 变量                     | 说明                                                                      |
+|--------------------------|---------------------------------------------------------------------------|
+| `BINANCE_API_KEY`        | 覆盖 `[api].api_key`（推荐用环境变量注入，避免落盘）                      |
+| `BINANCE_SECRET_KEY`     | 覆盖 `[api].secret_key`                                                    |
+| `APP__SECTION__KEY`      | 通用覆盖：双下划线分层级，如 `APP__CIRCUIT_BREAKER__MAX_DAILY_LOSS=20`     |
+| `RUST_LOG`               | tracing filter，例：`info,poly_btc_5m::execution=debug`                    |
+| `ENGINE_LOG_FILE`        | 日志重定向到文件（设置后不污染 TUI）                                       |
+| `HEADLESS`               | `=1` 时跳过 TUI 渲染，适合服务器 / 容器无 tty 环境                          |
+| `RUN_SECS`               | 仅 HEADLESS 模式下生效；运行 N 秒后自动退出，方便录制 / 压测                |
+
+## 配置详解
+
+所有 section 见 [`config.toml.example`](config.toml.example)。重点：
+
+| Section            | 关键字段                                                                                     |
+|--------------------|----------------------------------------------------------------------------------------------|
+| `[exchange]`       | `ws_endpoint`, `rest_endpoint`                                                               |
+| `[trading]`        | `symbol`, `poly_token_id`, `strike_price`, `default_volatility_annual`, `order_size_usdc`     |
+| `[websocket]`      | `ping_interval_secs`, `reconnect_base_ms / max_ms`                                            |
+| `[latency]`        | `warn_threshold_ms`, `report_interval_secs`                                                   |
+| `[orderbook]`      | `depth_levels`                                                                                |
+| `[api]`            | `api_key`, `secret_key`（推荐用环境变量覆盖）                                                |
+| `[logging]`        | `level`                                                                                       |
+| `[wallet]`         | `signature_mode`（eoa / safe / deposit_wallet）, `wallet_address`, `private_key`, `builder_code`, `polygon_rpc_url` |
+| `[circuit_breaker]`| `enabled`, `max_daily_loss`（USDC）, `max_consecutive_errors`                                |
+
+## 模块
+
+### User Channel WSS
+实盘启动后订阅 Polymarket `/user` 频道（本账户全部市场），按 order / trade 事件回灌 `AppState.my_orders` 与 `my_fills`，重启或 5m 窗口切换都能 resync ledger，避免靠轮询 GET。
+
+### 窗口收盘 on-chain merge
+当 5m 窗口结束、AppState 中 Up/Down 数量相等时，调用 NegRiskAdapter 的 `mergePositions(condId, pair_qty)` 1:1 兑回 pUSDC。两种执行路径：
+- **EOA**：私钥直接签 `eth_sendTransaction`
+- **Safe relayer**：通过 0x Safe Apps 风格的 relayer（参考 Polymarket 官方文档）
+
+### 持久化
+SQLite 库放在 `webui_db/`，由独立 writer task 经 mpsc 写入：
+- `pnl_samples` —— 30s 周期采样 net_pnl / cash_pnl / inventory_value
+- `my_orders` —— LiveOrderClient + resubmit 链每次 POST 的 order row
+- `my_fills` —— User-WSS 回灌的成交
+
+热路径（POST /order）不阻塞 SQLite IO。
+
+### 双前端
+- **TUI**（ratatui，默认）：实时盘口 / FV / 持仓 / pending orders / pnl 面板
+- **Web**（`web-ui/`，Leptos + axum static serve）：可读历史 pnl 曲线与成交明细
+
+### 🛑 安全熔断（CircuitBreaker）
+仅作用于实盘（`LiveOrderClient` + resubmit 链），dry-run / `ExecutionSim` 不受影响。
+
+**触发条件**：
+- `MaxDailyLoss`：`AppState.cash_pnl() < -[circuit_breaker].max_daily_loss`
+- `ConsecutiveErrors`：连续下单 reject / transport failed 次数 ≥ `max_consecutive_errors`
+
+**行为**：
+- 一旦 trip → 永久 `halted`：`dispatch_buy_intent` 直接 return，resubmit worker `drop resubmit`
+- 不可逆，**需重启进程恢复**
+- 启动期日志：`circuit breaker armed (live only)` + 阈值
+
+**关闭熔断**（不推荐）：`config.toml` 设 `[circuit_breaker].enabled = false`，或 `APP__CIRCUIT_BREAKER__ENABLED=false`。
 
 ## 目录结构
 
 ```
 src/
-  main.rs           # 入口、TUI 与事件循环
-  config.rs         # 配置加载
-  strategy/         # 信号与策略（signal.rs：稳态/激变态、追涨/配平、Maker 意图）
-  tui/              # 面板与 AppState（仓位、成交、挂单意图）
-  ws/               # Binance / Poly WebSocket 与市场发现
-  execution/        # 下单与签名（Poly API）
-  model/            # 订单簿、Ticker、成交解析
-  metrics/          # 延迟统计
-config/
-  default.toml      # 默认配置
-trades/             # 落盘 CSV（trades_{window_end_ts}.csv）
-excited_snapshots/  # 激变态快照 CSV（可选保留）
+  main.rs                      # 入口 / TUI 事件循环 / dry-run vs live 分支
+  config.rs                    # 配置加载（根目录 config.toml + env 覆盖）
+  cli.rs                       # clap 参数
+  strategy/                    # 信号 / FV / BS / 波动率
+  tui/                         # AppState + 面板渲染
+  ws/                          # Binance / Poly market WS + Poly user WS
+  execution/
+    transaction.rs             # LiveOrderClient + SharedClob + sign_and_post
+    circuit_breaker.rs         # 安全熔断（本仓库重点）
+    resubmit.rs                # FAK 部分成交 / 400 失败重发链
+    merge.rs / merge_*.rs      # NegRiskAdapter 收盘 merge
+    user_ws_handler.rs         # User-Channel 事件回灌
+    signer.rs                  # EOA / Safe 签名
+    sim.rs                     # ExecutionSim（dry-run 撮合）
+  web/                         # SQLite writer + axum 静态服务
+config.toml.example            # 配置模板（committed）
+config.toml                    # 本地配置（含私钥；.gitignore）
+web-ui/                        # Leptos 前端
+webui_db/                      # SQLite 库
+trades/ fv_snapshots/ ...      # 离线快照（.gitignore）
 ```
 
 ## 版本
-
-- **0.2.0**：只在激变态追涨、显式 `CHASE_ONLY_IN_EXCITED`、稳态清空追涨侧
-- **0.1.0**：初始版本（FV、稳态/激变态、追涨与配平、Maker 买模拟成交与落盘）
 
 详见 [CHANGELOG.md](CHANGELOG.md)。

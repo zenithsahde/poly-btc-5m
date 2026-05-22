@@ -60,6 +60,10 @@ pub async fn run_resubmit_worker(
 ) {
     info!("resubmit_worker started (max_attempts={})", MAX_RESUBMIT_ATTEMPTS);
     while let Some(req) = rx.recv().await {
+        if shared.circuit_breaker.is_halted() {
+            warn!(side = ?req.side, attempt = req.attempt, "circuit breaker halted — drop resubmit");
+            continue;
+        }
         tokio::time::sleep(Duration::from_millis(RESUBMIT_SPACING_MS)).await;
 
         let place_req = PlaceOrderRequest {
@@ -92,6 +96,11 @@ pub async fn run_resubmit_worker(
                     taking,
                     "resubmit POST ok"
                 );
+                if resp.success {
+                    shared.circuit_breaker.record_success();
+                } else {
+                    shared.circuit_breaker.record_error();
+                }
                 if attempt < MAX_RESUBMIT_ATTEMPTS {
                     if let Some(next) = build_next_request(&req, &resp, requested_size, taking) {
                         let _ = self_tx.send(next);
@@ -100,6 +109,7 @@ pub async fn run_resubmit_worker(
             }
             Err(e) => {
                 warn!(side = ?req.side, attempt, error = %e, "resubmit POST transport failed");
+                shared.circuit_breaker.record_error();
             }
         }
     }
