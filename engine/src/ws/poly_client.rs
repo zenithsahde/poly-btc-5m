@@ -75,6 +75,7 @@ impl PolyWsClient {
             s.poly_token_id = initial.up_token_id.clone();
             s.poly_down_token_id = initial.down_token_id.clone();
             s.poly_window_end_ts = initial.window_end_ts;
+            s.poly_condition_id = initial.condition_id;
         }
         Self {
             market,
@@ -378,6 +379,7 @@ impl PolyWsClient {
             s.poly_token_id = new_market.up_token_id.clone();
             s.poly_down_token_id = new_market.down_token_id.clone();
             s.poly_window_end_ts = new_market.window_end_ts;
+            s.poly_condition_id = new_market.condition_id;
             s.strike_price = if let Some(k_cl) = strike_from_chainlink {
                 info!(
                     "K 取自 Chainlink @ window_start: {:.2} (ts={})",

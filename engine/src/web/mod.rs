@@ -15,10 +15,12 @@ use tracing::{info, warn};
 
 use crate::tui::app::AppState;
 
-mod db;
+pub mod db;
 mod routes;
 mod snapshot;
 mod sse;
+
+pub use db::spawn_db_writer;
 
 #[derive(Clone)]
 pub struct WebState {

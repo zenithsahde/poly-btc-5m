@@ -3274,6 +3274,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rusqlite",
+ "rustc-hash",
  "serde",
  "serde_json",
  "sha2",

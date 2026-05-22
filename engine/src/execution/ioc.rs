@@ -70,7 +70,7 @@ pub fn execute_ioc_buy(
     }
 
     for (price, qty) in &fills {
-        s.apply_fill(side, true, false, *price, *qty, ts_ms, ub, ua, db, da);
+        s.apply_fill(side, true, false, *price, *qty, ts_ms, ub, ua, db, da, None);
         order.record_fill_at(*qty, *price, ts_ms);
     }
 
