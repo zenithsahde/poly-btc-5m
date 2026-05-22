@@ -228,6 +228,8 @@ pub struct AppState {
     pub poly_window_end_ts: i64,
     /// 当前市场 condition_id（链上 merge 入参；下单时也写入 my_orders.condition_id）
     pub poly_condition_id: B256,
+    /// 是否实盘模式（LiveOrderClient 构造成功后置 true；dry-run / 仅干跑保持 false）
+    pub is_live_mode: bool,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
     pub poly_bids: Vec<BookLevel>,
     /// Poly Up 订单簿卖盘（价格升序，最多 15 档）
@@ -337,6 +339,7 @@ impl AppState {
             poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
             poly_condition_id: B256::ZERO,
+            is_live_mode: false,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),
             poly_best_bid: 0.0,

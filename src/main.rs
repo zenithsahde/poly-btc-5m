@@ -178,6 +178,10 @@ async fn main() -> Result<()> {
                 resub_shared,
                 resubmit_tx,
             ));
+
+            if let Ok(mut s) = state.write() {
+                s.is_live_mode = true;
+            }
             Arc::new(live) as Arc<dyn OrderClient>
         } else {
             if cli.dry_run {
