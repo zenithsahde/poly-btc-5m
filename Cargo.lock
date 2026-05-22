@@ -3113,9 +3113,11 @@ name = "rust_engine"
 version = "0.4.5-5m"
 dependencies = [
  "alloy-contract",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-client",
+ "alloy-rpc-types-eth",
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types",

@@ -271,6 +271,8 @@ pub struct AppState {
     pub cash_paid: f64,
     /// 上次 merge 时间戳（ms），用于节流
     pub last_merge_ts_ms: i64,
+    /// 上次窗口收盘 merge 上链的 tx hash（dry-run 始终为 None）
+    pub last_merge_tx_hash: Option<String>,
     /// 配平提示 UP：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_up: Option<(f64, f64)>,
     /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
@@ -347,6 +349,7 @@ impl AppState {
             cash_received: 0.0,
             cash_paid: 0.0,
             last_merge_ts_ms: 0,
+            last_merge_tx_hash: None,
             rebalance_hint_up: None,
             rebalance_hint_down: None,
         }
@@ -664,30 +667,14 @@ impl AppState {
         // merged_pairs / merge_pnl / cash_received / cash_paid 仍跨窗口累积
     }
 
-    /// v0.4.3-5m: 窗口结算前的 redeem 模拟
-    ///   1. 先 force-merge 可配对部分（每对换 $1.00 USDC，避免输家边作废丢钱）
-    ///   2. 再按 BTC 真实方向把赢家边残仓 redeem（每张 $1.00 USDC）
-    ///   3. 输家边残仓直接清零（链上现实：作废）
-    /// 调用时机：窗口切换前一刻（poly_client.rs:switch_to_next_market）
+    // merge 由调用方在写锁外异步完成（on-chain 或 dry-run 虚拟），这里只处理胜出方赎回。
     pub fn settle_window_and_redeem(&mut self, binance_close: f64, ts_ms: i64) {
-        // (1) Force-merge 所有可配对（即使 avg_sum > 1 也 merge，因为 redeem 数学等价）
-        let pairs = self.mergeable_pairs();
-        if pairs > 0.0 {
-            let avg_sum = self.position_up.avg_price + self.position_down.avg_price;
-            self.merge_pnl += pairs * (1.0 - avg_sum);
-            self.cash_received += pairs * 1.0;
-            self.merged_pairs += pairs;
-            self.position_up.qty -= pairs;
-            self.position_down.qty -= pairs;
-            self.last_merge_ts_ms = ts_ms;
-            if self.position_up.qty <= 0.0 { self.position_up.avg_price = 0.0; }
-            if self.position_down.qty <= 0.0 { self.position_down.avg_price = 0.0; }
-        }
-        // (2) 残单边 redeem：按 BTC 是否高于 K 判定赢家
+        let _ = ts_ms;
+        // 残单边 redeem：按 BTC 是否高于 K 判定赢家
         if self.strike_price > 0.0 && binance_close > 0.0 {
             let up_wins = binance_close >= self.strike_price;
             if up_wins && self.position_up.qty > 0.0 {
-                // UP 赢：每张 $1.00（注意：cash_paid 已记入 buy 时的成本，所以净 = 1.00 - avg）
+                // UP 赢：每张 $1.00（cash_paid 已记入 buy 时的成本，所以净 = 1.00 - avg）
                 self.cash_received += self.position_up.qty * 1.0;
             } else if !up_wins && self.position_down.qty > 0.0 {
                 // DOWN 赢：每张 $1.00

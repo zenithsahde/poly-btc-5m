@@ -16,7 +16,9 @@ use tracing::{debug, info, warn};
 use crate::execution::client::{
     BuyIntent, OrderClient, OrderSide, OrderType, PlaceOrderRequest, PlaceOrderResult,
 };
+use crate::execution::merge::{MergeClient, MergeOutcome};
 use crate::execution::signer::{Order, PolySigner};
+use alloy_primitives::B256;
 use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason, PositionSide};
 use crate::tui::app::AppState;
 
@@ -72,6 +74,21 @@ impl ApiCreds {
         mac.update(path);
         mac.update(body);
         URL_SAFE.encode(mac.finalize().into_bytes())
+    }
+
+    #[inline]
+    pub fn sign_for_relayer(&self, ts: u64, method: &[u8], path: &[u8], body: &[u8]) -> String {
+        self.sign(ts, method, path, body)
+    }
+
+    #[inline]
+    pub fn api_key_header(&self) -> &HeaderValue {
+        &self.api_key_hv
+    }
+
+    #[inline]
+    pub fn passphrase_header(&self) -> &HeaderValue {
+        &self.passphrase_hv
     }
 }
 
@@ -208,6 +225,13 @@ pub struct LiveOrderClient {
     shared: Arc<SharedClob>,
     post_template: reqwest::Request,
     delete_template: reqwest::Request,
+    merge_client: Option<Arc<MergeClient>>,
+}
+
+impl LiveOrderClient {
+    pub fn attach_merge_client(&mut self, mc: Arc<MergeClient>) {
+        self.merge_client = Some(mc);
+    }
 }
 
 impl LiveOrderClient {
@@ -266,6 +290,7 @@ impl LiveOrderClient {
             }),
             post_template,
             delete_template,
+            merge_client: None,
         })
     }
 }
@@ -358,6 +383,14 @@ impl OrderClient for LiveOrderClient {
         self.shared
             .delete_order(clone_template(&self.delete_template), order_id)
             .await
+    }
+
+    async fn merge_pairs(&self, condition_id: B256, pair_qty: f64) -> Result<MergeOutcome> {
+        let mc = self
+            .merge_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("LiveOrderClient: MergeClient 未挂载，启动期未注入"))?;
+        mc.merge_pairs(condition_id, pair_qty).await
     }
 
     fn dispatch_buy_intent(

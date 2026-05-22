@@ -1,5 +1,7 @@
+use crate::execution::merge::MergeOutcome;
 use crate::position::PendingOrderReason;
 use crate::tui::app::{AppState, ChaseSide};
+use alloy_primitives::B256;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,4 +68,18 @@ pub trait OrderClient: Send + Sync {
         target_down: f64,
         now_ms: i64,
     ) -> (bool, bool);
+
+    /// 默认给 dry-run 用：返回零哈希，表示「虚拟兑现」。LiveOrderClient 会覆写走 on-chain / relayer。
+    async fn merge_pairs(
+        &self,
+        condition_id: B256,
+        pair_qty: f64,
+    ) -> anyhow::Result<MergeOutcome> {
+        let _ = condition_id;
+        Ok(MergeOutcome {
+            pair_qty,
+            tx_hash: B256::ZERO,
+            elapsed_ms: 0,
+        })
+    }
 }
