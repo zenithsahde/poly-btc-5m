@@ -211,6 +211,8 @@ pub struct AppState {
     pub poly_market_slug: String,
     /// 当前 Poly Token ID（切换市场时更新，供下单使用）
     pub poly_token_id: String,
+    /// 当前 Poly Token ID（DOWN 侧；live 模式下 DOWN 单要单独的 tokenId）
+    pub poly_down_token_id: String,
     /// 下一 5m 窗口切换时间戳 (Unix 秒)
     pub poly_window_end_ts: i64,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
@@ -254,10 +256,10 @@ pub struct AppState {
     pub realized_pnl: f64,
     /// 当前可追涨侧（用于展示与浮亏减仓；UP 优先，若 UP 满足则显 UP）
     pub chase_side: Option<ChaseSide>,
-    /// Maker 买意图：UP 侧 (挂单价, 数量, placed_ts_ms)：追涨 5 张，配平为计算出的配平量
-    pub maker_buy_intent_up: Option<(f64, f64, i64)>,
-    /// Maker 买意图：DOWN 侧 (挂单价, 数量, placed_ts_ms)
-    pub maker_buy_intent_down: Option<(f64, f64, i64)>,
+    /// 当前 pending Maker/Taker 买单（UP 侧）。dry-run 由 ExecutionSim 推进；实盘由 LiveOrderClient 写入。
+    pub pending_order_up: Option<crate::position::ManagedOrder>,
+    /// 当前 pending Maker/Taker 买单（DOWN 侧）
+    pub pending_order_down: Option<crate::position::ManagedOrder>,
     /// === v0.4.0-5m: Merge-based 经济模型字段 ===
     /// 累计已虚拟 merge 的对数（每对兑换 1.00 USDC）
     pub merged_pairs: f64,
@@ -311,6 +313,7 @@ impl AppState {
             snipe_threshold_bps: 12.0,
             poly_market_slug: "Finding...".to_string(),
             poly_token_id: String::new(),
+            poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),
@@ -337,8 +340,8 @@ impl AppState {
             total_rebate: 0.0,
             realized_pnl: 0.0,
             chase_side: None,
-            maker_buy_intent_up: None,
-            maker_buy_intent_down: None,
+            pending_order_up: None,
+            pending_order_down: None,
             merged_pairs: 0.0,
             merge_pnl: 0.0,
             cash_received: 0.0,
@@ -397,13 +400,21 @@ impl AppState {
     /// 若当前 Maker 买挂单均成交，UP 侧预估持仓量（用意图中的数量）
     pub fn projected_qty_up_after_intents(&self) -> f64 {
         self.position_up.qty
-            + self.maker_buy_intent_up.map(|(_, q, _)| q).unwrap_or(0.0)
+            + self
+                .pending_order_up
+                .as_ref()
+                .map(|o| o.remaining_qty())
+                .unwrap_or(0.0)
     }
 
     /// 若当前 Maker 买挂单均成交，DOWN 侧预估持仓量
     pub fn projected_qty_down_after_intents(&self) -> f64 {
         self.position_down.qty
-            + self.maker_buy_intent_down.map(|(_, q, _)| q).unwrap_or(0.0)
+            + self
+                .pending_order_down
+                .as_ref()
+                .map(|o| o.remaining_qty())
+                .unwrap_or(0.0)
     }
 
     /// 若当前 Maker 买挂单均成交，预估的仓位均价之和（用于配平与约束判断）
@@ -413,24 +424,26 @@ impl AppState {
             self.position_down.avg_price,
         );
         let (qty_up, qty_down) = (self.position_up.qty, self.position_down.qty);
-        let proj_avg_up = match self.maker_buy_intent_up {
-            Some((p, q, _)) => {
+        let proj_avg_up = match self.pending_order_up.as_ref() {
+            Some(o) => {
+                let q = o.remaining_qty();
                 let new_qty = qty_up + q;
                 if new_qty > 0.0 {
-                    (qty_up * avg_up + p * q) / new_qty
+                    (qty_up * avg_up + o.price * q) / new_qty
                 } else {
-                    p
+                    o.price
                 }
             }
             None => avg_up,
         };
-        let proj_avg_down = match self.maker_buy_intent_down {
-            Some((p, q, _)) => {
+        let proj_avg_down = match self.pending_order_down.as_ref() {
+            Some(o) => {
+                let q = o.remaining_qty();
                 let new_qty = qty_down + q;
                 if new_qty > 0.0 {
-                    (qty_down * avg_down + p * q) / new_qty
+                    (qty_down * avg_down + o.price * q) / new_qty
                 } else {
-                    p
+                    o.price
                 }
             }
             None => avg_down,
@@ -642,8 +655,8 @@ impl AppState {
     pub fn reset_inventory_for_new_window(&mut self) {
         self.position_up = Position::default();
         self.position_down = Position::default();
-        self.maker_buy_intent_up = None;
-        self.maker_buy_intent_down = None;
+        self.pending_order_up = None;
+        self.pending_order_down = None;
         self.chase_side = None;
         self.rebalance_hint_up = None;
         self.rebalance_hint_down = None;

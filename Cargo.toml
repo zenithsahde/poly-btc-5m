@@ -70,6 +70,26 @@ alloy-signer = { version = "0.5" }
 alloy-signer-local = { version = "0.5" }
 hex = "0.4"
 
+# Polygon RPC（pUSD 余额查询）
+alloy-provider = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-rpc-client = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-contract = { version = "0.5", default-features = false }
+
+# async trait（OrderClient）
+async-trait = "0.1"
+
+# L2 HMAC 鉴权（POLY_SIGNATURE）
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# 随机 salt
+rand = "0.8"
+
+# 字节缓冲（HTTP 请求体）
+bytes = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

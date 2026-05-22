@@ -10,7 +10,9 @@ use tracing::warn;
 
 use crate::{
     config::AppConfig,
+    execution::client::{BuyIntent, OrderClient},
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
+    position::PendingOrderReason,
     strategy::{
         bs_model,
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -114,6 +116,7 @@ pub struct SignalEngine {
     config: AppConfig,
     orderbook: LocalOrderBook,
     state: Arc<RwLock<AppState>>,
+    order_client: Arc<dyn OrderClient>,
     vol_calc: RollingVolatility,
     /// 币安 mid 历史 (ts_ms, mid)，用于稳态/激变态判定，保留约 5 秒
     binance_mid_history: VecDeque<(u64, f64)>,
@@ -135,13 +138,18 @@ pub struct SignalEngine {
 }
 
 impl SignalEngine {
-    pub fn new(config: AppConfig, state: Arc<RwLock<AppState>>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        state: Arc<RwLock<AppState>>,
+        order_client: Arc<dyn OrderClient>,
+    ) -> Self {
         let depth_limit = config.orderbook.depth_levels;
         let symbol = config.trading.symbol.clone();
         Self {
             config,
             orderbook: LocalOrderBook::new(&symbol, depth_limit),
             state,
+            order_client,
             vol_calc: RollingVolatility::new(500),
             binance_mid_history: VecDeque::with_capacity(200),
             last_was_steady: false,
@@ -600,36 +608,18 @@ impl SignalEngine {
                     let target_down = (fair_down - SAFETY_MARGIN).max(0.0);
                     let now_ms = chrono::Utc::now().timestamp_millis();
 
-                    // ① 先处理 pending maker 挂单：fill / timeout / reprice
+                    // ① 先处理 pending 挂单：交给 OrderClient（dry-run: ExecutionSim；live: LiveOrderClient）
                     if let Ok(mut s) = self.state.write() {
-                        let (ub, ua, db, da) = (s.poly_best_bid, s.poly_best_ask, s.poly_down_best_bid, s.poly_down_best_ask);
-                        // UP 侧 pending
-                        if let Some((p, q, placed_ts)) = s.maker_buy_intent_up {
-                            if ua > 0.0 && ua <= p {
-                                s.apply_fill(ChaseSide::Up, true, true /*maker*/, p, q, now_ms, ub, ua, db, da);
-                                self.last_taker_up_ts_ms = now_ms;
-                                s.maker_buy_intent_up = None;
-                            } else if now_ms - placed_ts > MAKER_TIMEOUT_MS {
-                                s.maker_buy_intent_up = None;
-                            } else if (target_up - p).abs() >= REPRICE_TICK_THRESH {
-                                s.maker_buy_intent_up = None;
-                            }
+                        let (up_fill, down_fill) =
+                            self.order_client.tick(&mut s, target_up, target_down, now_ms);
+                        if up_fill {
+                            self.last_taker_up_ts_ms = now_ms;
                         }
-                        // DOWN 侧 pending
-                        if let Some((p, q, placed_ts)) = s.maker_buy_intent_down {
-                            if da > 0.0 && da <= p {
-                                s.apply_fill(ChaseSide::Down, true, true /*maker*/, p, q, now_ms, ub, ua, db, da);
-                                self.last_taker_down_ts_ms = now_ms;
-                                s.maker_buy_intent_down = None;
-                            } else if now_ms - placed_ts > MAKER_TIMEOUT_MS {
-                                s.maker_buy_intent_down = None;
-                            } else if (target_down - p).abs() >= REPRICE_TICK_THRESH {
-                                s.maker_buy_intent_down = None;
-                            }
+                        if down_fill {
+                            self.last_taker_down_ts_ms = now_ms;
                         }
 
                         // 稳态时清 chase_side（停 chase 显示）
-                        // v0.4.11 修正：不再清 maker_buy_intent — 偏仓配平挂单在稳态需保留
                         if steady {
                             s.chase_side = None;
                         } else {
@@ -666,26 +656,46 @@ impl SignalEngine {
                         && pair_health_ok_down
                         && target_down > 0.0 && target_down <= MAX_BUY_PRICE;
 
-                    // ③ 实施：best_ask ≤ 目标 → 立即 taker；否则挂 maker
-                    // 不再用 !steady 一刀切守门 — 偏仓配平路径在稳态也要工作
+                    // ③ 派发 BuyIntent 到 OrderClient：marketable→FAK，否则 GTC；
+                    //    live 模式下 best_ask≤target 时立刻更新节流（不等 WS fill）
                     if want_buy_up || want_buy_down {
                         if let Ok(mut s) = self.state.write() {
-                            let (ub, ua, db, da) = (s.poly_best_bid, s.poly_best_ask, s.poly_down_best_bid, s.poly_down_best_ask);
-                            if want_buy_up && s.maker_buy_intent_up.is_none() {
+                            let up_token = s.poly_token_id.clone();
+                            let down_token = s.poly_down_token_id.clone();
+                            let (ua, da) = (s.poly_best_ask, s.poly_down_best_ask);
+                            if want_buy_up {
+                                let intent = BuyIntent {
+                                    side: ChaseSide::Up,
+                                    qty: MAKER_BUY_CHASE_MIN_QTY,
+                                    target: target_up,
+                                    reason: if chase_buy_up {
+                                        PendingOrderReason::Chase
+                                    } else {
+                                        PendingOrderReason::Rebalance
+                                    },
+                                };
                                 if ua > 0.0 && ua <= target_up {
-                                    s.apply_fill(ChaseSide::Up, true, false /*taker*/, ua, MAKER_BUY_CHASE_MIN_QTY, now_ms, ub, ua, db, da);
                                     self.last_taker_up_ts_ms = now_ms;
-                                } else {
-                                    s.maker_buy_intent_up = Some((target_up, MAKER_BUY_CHASE_MIN_QTY, now_ms));
                                 }
+                                self.order_client
+                                    .dispatch_buy_intent(&intent, ua, &up_token, now_ms, &mut s);
                             }
-                            if want_buy_down && s.maker_buy_intent_down.is_none() {
+                            if want_buy_down {
+                                let intent = BuyIntent {
+                                    side: ChaseSide::Down,
+                                    qty: MAKER_BUY_CHASE_MIN_QTY,
+                                    target: target_down,
+                                    reason: if chase_buy_down {
+                                        PendingOrderReason::Chase
+                                    } else {
+                                        PendingOrderReason::Rebalance
+                                    },
+                                };
                                 if da > 0.0 && da <= target_down {
-                                    s.apply_fill(ChaseSide::Down, true, false, da, MAKER_BUY_CHASE_MIN_QTY, now_ms, ub, ua, db, da);
                                     self.last_taker_down_ts_ms = now_ms;
-                                } else {
-                                    s.maker_buy_intent_down = Some((target_down, MAKER_BUY_CHASE_MIN_QTY, now_ms));
                                 }
+                                self.order_client
+                                    .dispatch_buy_intent(&intent, da, &down_token, now_ms, &mut s);
                             }
                         }
                     }
@@ -811,31 +821,16 @@ impl SignalEngine {
                         ));
                     }
 
-                    // Maker 买模拟成交：我们挂买单，成交 = 卖盘跌到我们挂买价或以下（有人卖到我们这一档），即 best_ask <= 挂单价
+                    // Poly 盘口变动也驱动 OrderClient 推进 pending 挂单（fill / ttl）；
+                    // 传 0.0 目标价 → 跳过 reprice 检查（reprice 仅 BookTicker 决策帧触发）
                     let ts_ms = chrono::Utc::now().timestamp_millis();
-                    let (up_bid, up_ask, down_bid, down_ask) = (
-                        s.poly_best_bid,
-                        s.poly_best_ask,
-                        s.poly_down_best_bid,
-                        s.poly_down_best_ask,
-                    );
-                    // v0.4.11 marketable limit：PolyBookUpdate 时检查 maker 挂单 fill
-                    //   触发条件：best_ask ≤ 挂单价 (Poly 跌到目标价)
-                    if let Some((p, q, placed_ts)) = s.maker_buy_intent_up {
-                        if up_ask > 0.0 && up_ask <= p {
-                            s.apply_fill(ChaseSide::Up, true, true /*maker*/, p, q, ts_ms, up_bid, up_ask, down_bid, down_ask);
-                            s.maker_buy_intent_up = None;
-                        } else if ts_ms - placed_ts > MAKER_TIMEOUT_MS {
-                            s.maker_buy_intent_up = None;
-                        }
+                    let (up_fill, down_fill) =
+                        self.order_client.tick(&mut s, 0.0, 0.0, ts_ms);
+                    if up_fill {
+                        self.last_taker_up_ts_ms = ts_ms;
                     }
-                    if let Some((p, q, placed_ts)) = s.maker_buy_intent_down {
-                        if down_ask > 0.0 && down_ask <= p {
-                            s.apply_fill(ChaseSide::Down, true, true /*maker*/, p, q, ts_ms, up_bid, up_ask, down_bid, down_ask);
-                            s.maker_buy_intent_down = None;
-                        } else if ts_ms - placed_ts > MAKER_TIMEOUT_MS {
-                            s.maker_buy_intent_down = None;
-                        }
+                    if down_fill {
+                        self.last_taker_down_ts_ms = ts_ms;
                     }
 
                     // v0.4.0-5m：虚拟 merge 触发（替代旧浮亏 sell 减仓）

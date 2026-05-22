@@ -29,6 +29,8 @@ pub struct TradingConfig {
     /// 稳态下用 Poly 反解 IV 时的 σ 上限（允许更高以便 FV 贴近 Poly 盘口，例如 5.0）
     #[serde(default = "default_sigma_max_poly")]
     pub volatility_sigma_max_poly: f64,
+    /// 每笔 BuyIntent 的下单名义额（USDC）；必填，无代码默认。qty_shares = order_size_usdc / target
+    pub order_size_usdc: f64,
 }
 
 fn default_strike_price() -> f64 { 96000.0 }
@@ -77,6 +79,9 @@ pub struct WalletConfig {
     pub signature_mode: crate::execution::signer::SignatureMode,
     #[serde(default)]
     pub builder_code: Option<String>,
+    /// Polygon RPC（pUSD 余额查询用）
+    #[serde(default)]
+    pub polygon_rpc_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

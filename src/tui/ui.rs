@@ -375,8 +375,14 @@ fn render_poly_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout::Rec
     frame.render_widget(block, area);
 
     // 挂单信息：用于在订单簿档位打标及底部汇总
-    let up_buy = s.maker_buy_intent_up;
-    let down_buy = s.maker_buy_intent_down;
+    let up_buy: Option<(f64, f64, i64)> = s
+        .pending_order_up
+        .as_ref()
+        .map(|o| (o.price, o.remaining_qty(), o.placed_ts_ms));
+    let down_buy: Option<(f64, f64, i64)> = s
+        .pending_order_down
+        .as_ref()
+        .map(|o| (o.price, o.remaining_qty(), o.placed_ts_ms));
     // v0.4.0-5m：sell 全部废弃，挂单只剩 maker buy（卖侧用 merge 退出）
     let up_sell: Option<(f64, f64)> = None;
     let down_sell: Option<(f64, f64)> = None;
@@ -744,8 +750,8 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
             Span::styled(chase_str, Style::default().fg(Color::Yellow)),
         ]),
         Line::from({
-            let up_str = s.maker_buy_intent_up.map(|(p, q, _)| format!("UP @ {:.2}×{:.0}", p, q)).unwrap_or_else(|| "—".to_string());
-            let down_str = s.maker_buy_intent_down.map(|(p, q, _)| format!("DOWN @ {:.2}×{:.0}", p, q)).unwrap_or_else(|| "—".to_string());
+            let up_str = s.pending_order_up.as_ref().map(|o| format!("UP @ {:.2}×{:.0}", o.price, o.remaining_qty())).unwrap_or_else(|| "—".to_string());
+            let down_str = s.pending_order_down.as_ref().map(|o| format!("DOWN @ {:.2}×{:.0}", o.price, o.remaining_qty())).unwrap_or_else(|| "—".to_string());
             vec![
                 Span::raw("  挂单 "),
                 Span::styled("Maker买", Style::default().fg(Color::Cyan)),
