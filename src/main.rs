@@ -29,6 +29,7 @@ mod model;
 mod position;
 mod strategy;
 mod tui;
+mod web;
 mod ws;
 
 use alloy_primitives::Address;
@@ -68,6 +69,10 @@ async fn main() -> Result<()> {
     if let Ok(mut s) = state.write() {
         s.strike_price = cfg.trading.strike_price;
     }
+
+    // ── 1b.1 SQLite writer：所有持久化（pnl_samples / my_orders / my_fills）走 mpsc，
+    //        POST 热路径不阻塞 sqlite IO。dry-run 与实盘都启动，方便用同一套工具看 PnL。
+    let db_tx = web::spawn_db_writer()?;
 
     // ── 1c. 区分 dry-run / 实盘模式，构造对应 OrderClient ────────
     let private_key = cfg
@@ -114,25 +119,18 @@ async fn main() -> Result<()> {
             info!("derive-api-key ok (api_key={}…)", &api_key[..api_key.len().min(8)]);
             let creds = ApiCreds::new(&api_key, &secret, &passphrase)?;
 
-            // User channel WS：订阅本账户所有市场的 order / trade 事件。
-            // 暂时只投递到 mpsc + tracing；后续接 AppState/ledger 回灌 fill。
-            let (user_ev_tx, mut user_ev_rx) = tokio::sync::mpsc::channel(256);
+            // User channel WS：订阅本账户所有市场的 order / trade 事件，
+            // 经 user_ws_handler 回灌 ledger + my_orders / my_fills。
+            let (user_ev_tx, user_ev_rx) = tokio::sync::mpsc::channel(256);
             let user_ws = Arc::new(ws::poly_user_ws::PolyUserWs::new(
                 api_key, secret, passphrase, user_ev_tx,
             ));
             tokio::spawn(user_ws.run());
-            tokio::spawn(async move {
-                while let Some(ev) = user_ev_rx.recv().await {
-                    match ev {
-                        ws::poly_user_ws::UserEvent::Order(o) => {
-                            info!(?o, "poly user order event")
-                        }
-                        ws::poly_user_ws::UserEvent::Trade(t) => {
-                            info!(?t, "poly user trade event")
-                        }
-                    }
-                }
-            });
+            tokio::spawn(execution::user_ws_handler::run_user_event_handler(
+                user_ev_rx,
+                Arc::clone(&state),
+                db_tx.clone(),
+            ));
 
             // 余额查询（失败仅日志，不阻塞启动）
             if polygon_rpc_url.is_empty() {
@@ -165,9 +163,21 @@ async fn main() -> Result<()> {
                 MAIN_MAKER_TIMEOUT_MS,
                 Arc::clone(&state),
                 http,
+                db_tx.clone(),
             )
             .await?;
             live.attach_merge_client(Arc::new(merge_client));
+
+            // Resubmit 链：tx 注入 LiveOrderClient + worker spawn（self_tx 用于链式自送）
+            let (resubmit_tx, resubmit_rx) =
+                tokio::sync::mpsc::unbounded_channel::<execution::resubmit::ResubmitRequest>();
+            live.attach_resubmit_tx(resubmit_tx.clone());
+            let resub_shared = live.shared();
+            tokio::spawn(execution::resubmit::run_resubmit_worker(
+                resubmit_rx,
+                resub_shared,
+                resubmit_tx,
+            ));
             Arc::new(live) as Arc<dyn OrderClient>
         } else {
             if cli.dry_run {
@@ -299,6 +309,25 @@ async fn main() -> Result<()> {
     let snap30_task = tokio::spawn(async move {
         strategy::snap30ms::run_snapshot_task(snap30_state).await;
     });
+
+    // ── 6c. 启动 30s PnL 采样 task：把 net_pnl / cash_pnl / inventory_value 落到 pnl_samples
+    //        给 Web UI / 回测看（dry-run 也跑，用同一套工具）。
+    {
+        let pnl_state = Arc::clone(&state);
+        let pnl_tx = db_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let sample = match pnl_state.write() {
+                    Ok(mut s) => s.record_web_pnl_sample(),
+                    Err(p) => p.into_inner().record_web_pnl_sample(),
+                };
+                if let Some(point) = sample {
+                    let _ = pnl_tx.send(web::DbMsg::PnlSample(point));
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
 
     // ── 7. Headless 模式（HEADLESS=1 跳过 TUI，用于数据采集后台运行）──
     let headless = std::env::var("HEADLESS").map(|v| v == "1").unwrap_or(false);

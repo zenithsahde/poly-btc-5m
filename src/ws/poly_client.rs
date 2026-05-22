@@ -72,6 +72,7 @@ impl PolyWsClient {
             s.poly_token_id = initial.up_token_id.clone();
             s.poly_down_token_id = initial.down_token_id.clone();
             s.poly_window_end_ts = initial.window_end_ts;
+            s.poly_condition_id = initial.condition_id;
         }
         Self {
             market,
@@ -328,6 +329,7 @@ impl PolyWsClient {
             s.poly_token_id = new_market.up_token_id.clone();
             s.poly_down_token_id = new_market.down_token_id.clone();
             s.poly_window_end_ts = new_market.window_end_ts;
+            s.poly_condition_id = new_market.condition_id;
             s.strike_price = match strike_from_binance {
                 Ok(open) => {
                     info!("K 取自币安窗口开始秒内首笔成交: {:.2} (ts={})", open, window_start_ts);

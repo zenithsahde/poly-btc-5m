@@ -25,14 +25,21 @@ pub struct PlaceOrderRequest {
     pub order_type: OrderType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlaceOrderResult {
     pub order_id: String,
     pub success: bool,
     pub status: String,
-    pub filled_price: Option<f64>,
-    pub filled_size: Option<f64>,
-    pub error: Option<String>,
+    /// 服务端回包的 makingAmount（字符串原值经 parse；缺失则 None）
+    pub making_amount: Option<f64>,
+    /// 服务端回包的 takingAmount（FAK 部分成交的成交量在这里）
+    pub taking_amount: Option<f64>,
+    /// 服务端附带的链上交易 hash 数组（unmatched 时缺，故空）
+    pub transactions_hashes: Vec<String>,
+    /// 服务端附带的 trade_ids 数组（用于回灌 / 调试）
+    pub trade_ids: Vec<String>,
+    /// 失败 (400/5xx) 或服务端返回 success=false 时的 errorMsg
+    pub error_msg: Option<String>,
     pub elapsed: u64,
 }
 

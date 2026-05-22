@@ -164,7 +164,7 @@ impl ExecutionSim {
                 continue;
             }
             let take = remaining.min(level.qty);
-            s.apply_fill(side, true, false, level.price, take, now_ms, ub, ua, db, da);
+            s.apply_fill(side, true, false, level.price, take, now_ms, ub, ua, db, da, None);
             order.record_fill_at(take, level.price, now_ms);
             remaining -= take;
         }
@@ -213,7 +213,7 @@ impl ExecutionSim {
         if fill_qty <= 0.0 {
             return false;
         }
-        s.apply_fill(side, true, true, order.price, fill_qty, now_ms, ub, ua, db, da);
+        s.apply_fill(side, true, true, order.price, fill_qty, now_ms, ub, ua, db, da, None);
         order.record_fill_at(fill_qty, order.price, now_ms);
         true
     }
@@ -285,10 +285,8 @@ impl OrderClient for ExecutionSim {
             order_id: "dry".to_string(),
             success: true,
             status: "dry_run".to_string(),
-            filled_price: None,
-            filled_size: None,
-            error: None,
             elapsed: 0,
+            ..Default::default()
         })
     }
 

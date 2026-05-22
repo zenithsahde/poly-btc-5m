@@ -93,6 +93,13 @@ rand = "0.8"
 # 字节缓冲（HTTP 请求体）
 bytes = "1"
 
+# 本地 SQLite 持久化（my_orders / my_fills / pnl_samples）
+# bundled = 自带 libsqlite3，免去系统依赖
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# FxHashSet（trade_id 去重）
+rustc-hash = "2"
+
 [profile.release]
 opt-level = 3
 lto = true

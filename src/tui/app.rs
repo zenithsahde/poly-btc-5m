@@ -5,7 +5,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use alloy_primitives::B256;
 use chrono::TimeZone;
+use rustc_hash::FxHashSet;
 
 /// 面板展示用的单条成交记录
 #[derive(Clone, Debug)]
@@ -55,6 +57,15 @@ pub struct DelayStats {
     pub sum_neg_ms: f64,
     pub min_neg_ms: f64,
     pub max_neg_ms: f64,
+}
+
+/// Web/SQLite PnL 时序采样点（每 30s 一帧）
+#[derive(Clone, Debug, Default)]
+pub struct WebPnlPoint {
+    pub uptime_secs: u64,
+    pub net_pnl: f64,
+    pub cash_pnl: f64,
+    pub inventory_value: f64,
 }
 
 /// 当前可追涨的一侧（UP/DOWN 不会同时涨）
@@ -215,6 +226,8 @@ pub struct AppState {
     pub poly_down_token_id: String,
     /// 下一 5m 窗口切换时间戳 (Unix 秒)
     pub poly_window_end_ts: i64,
+    /// 当前市场 condition_id（链上 merge 入参；下单时也写入 my_orders.condition_id）
+    pub poly_condition_id: B256,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
     pub poly_bids: Vec<BookLevel>,
     /// Poly Up 订单簿卖盘（价格升序，最多 15 档）
@@ -277,6 +290,12 @@ pub struct AppState {
     pub rebalance_hint_up: Option<(f64, f64)>,
     /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_down: Option<(f64, f64)>,
+    /// 已应用过的 trade_id 集合（User-WS MATCHED 去重，避免重投/快照重发双计 PnL）
+    pub seen_fill_ids: FxHashSet<String>,
+    /// Web/SQLite PnL 时序历史（30s 一帧，最多 5760 点 ≈ 2 天）
+    pub web_pnl_history: VecDeque<WebPnlPoint>,
+    /// 上次 PnL 采样的 uptime 秒数（节流到每 30s 一帧）
+    pub last_web_pnl_sample_secs: Option<u64>,
 }
 
 impl AppState {
@@ -317,6 +336,7 @@ impl AppState {
             poly_token_id: String::new(),
             poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
+            poly_condition_id: B256::ZERO,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),
             poly_best_bid: 0.0,
@@ -352,7 +372,38 @@ impl AppState {
             last_merge_tx_hash: None,
             rebalance_hint_up: None,
             rebalance_hint_down: None,
+            seen_fill_ids: FxHashSet::default(),
+            web_pnl_history: VecDeque::new(),
+            last_web_pnl_sample_secs: None,
         }
+    }
+
+    /// 30s 节流的 PnL 采样：达到节流间隔时返回新一帧，否则返回 None。
+    /// 投递到 `DbMsg::PnlSample` 写入 SQLite。
+    pub fn record_web_pnl_sample(&mut self) -> Option<WebPnlPoint> {
+        const SAMPLE_SECS: u64 = 30;
+        const KEEP_POINTS: usize = 5760; // 2 days at 30s cadence
+
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        if let Some(last) = self.last_web_pnl_sample_secs {
+            if uptime_secs.saturating_sub(last) < SAMPLE_SECS {
+                return None;
+            }
+        }
+
+        let point = WebPnlPoint {
+            uptime_secs,
+            net_pnl: self.net_pnl(),
+            cash_pnl: self.cash_pnl(),
+            inventory_value: self.inventory_value(),
+        };
+        self.web_pnl_history.push_back(point.clone());
+        self.last_web_pnl_sample_secs = Some(uptime_secs);
+
+        while self.web_pnl_history.len() > KEEP_POINTS {
+            self.web_pnl_history.pop_front();
+        }
+        Some(point)
     }
 
     /// Poly 数据延迟（毫秒），无数据时返回 None
@@ -556,12 +607,19 @@ impl AppState {
         up_ask: f64,
         down_bid: f64,
         down_ask: f64,
+        fee_bps_override: Option<f64>,
     ) {
         debug_assert!(buy_sell, "v0.4.0-5m: apply_fill 只支持 buy；sell 由 apply_merge 处理");
         if !buy_sell { return; } // 防御性：永不执行 sell 分支
 
-        let p_clamped = price.clamp(0.0, 1.0);
-        let taker_fee = qty * 0.072 * p_clamped * (1.0 - p_clamped);
+        // 优先使用 WS 真值 fee_rate_bps；缺失则 fallback dry-run 公式（qty × 7.2bps × p × (1-p)）
+        let taker_fee = match fee_bps_override {
+            Some(bps) if bps > 0.0 => qty * price * (bps / 10_000.0),
+            _ => {
+                let p = price.clamp(0.0, 1.0);
+                qty * 0.072 * p * (1.0 - p)
+            }
+        };
         if maker_taker {
             self.total_rebate += taker_fee * 0.25;
         } else {

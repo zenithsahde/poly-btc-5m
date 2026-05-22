@@ -17,10 +17,14 @@ use crate::execution::client::{
     BuyIntent, OrderClient, OrderSide, OrderType, PlaceOrderRequest, PlaceOrderResult,
 };
 use crate::execution::merge::{MergeClient, MergeOutcome};
+use crate::execution::resubmit::{
+    ResubmitRequest, ResubmitSender, MAX_RESUBMIT_ATTEMPTS, MIN_RESUBMIT_SHARES,
+};
 use crate::execution::signer::{Order, PolySigner};
 use alloy_primitives::B256;
 use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason, PositionSide};
 use crate::tui::app::AppState;
+use crate::web::db::{DbMsg, DbSender, MyOrderRow};
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
 const ORDER_URL: &str = "https://clob.polymarket.com/order";
@@ -192,13 +196,17 @@ fn build_request_template(
     Ok(req)
 }
 
-struct SharedClob {
-    creds: ApiCreds,
-    http: Client,
-    state: Arc<RwLock<AppState>>,
-    order_size_usdc: f64,
-    maker_timeout_ms: i64,
-    reprice_threshold: f64,
+pub struct SharedClob {
+    pub creds: ApiCreds,
+    pub http: Client,
+    pub state: Arc<RwLock<AppState>>,
+    pub order_size_usdc: f64,
+    pub maker_timeout_ms: i64,
+    pub reprice_threshold: f64,
+    pub db_tx: DbSender,
+    pub resubmit_tx: Option<ResubmitSender>,
+    pub post_template: reqwest::Request,
+    pub signer: Arc<PolySigner>,
 }
 
 impl SharedClob {
@@ -221,9 +229,7 @@ impl SharedClob {
 }
 
 pub struct LiveOrderClient {
-    signer: Arc<PolySigner>,
     shared: Arc<SharedClob>,
-    post_template: reqwest::Request,
     delete_template: reqwest::Request,
     merge_client: Option<Arc<MergeClient>>,
 }
@@ -231,6 +237,19 @@ pub struct LiveOrderClient {
 impl LiveOrderClient {
     pub fn attach_merge_client(&mut self, mc: Arc<MergeClient>) {
         self.merge_client = Some(mc);
+    }
+
+    /// 启动期注入 resubmit channel sender。注入时 LiveOrderClient 还没被 Arc 包成多份引用，
+    /// `Arc::get_mut` 可以安全写入 SharedClob 内的字段。
+    pub fn attach_resubmit_tx(&mut self, tx: ResubmitSender) {
+        if let Some(s) = Arc::get_mut(&mut self.shared) {
+            s.resubmit_tx = Some(tx);
+        }
+    }
+
+    /// 暴露 Arc<SharedClob> 给 resubmit worker 复用 sign_and_post。
+    pub fn shared(&self) -> Arc<SharedClob> {
+        Arc::clone(&self.shared)
     }
 }
 
@@ -241,6 +260,7 @@ impl LiveOrderClient {
         order_size_usdc: f64,
         maker_timeout_ms: i64,
         state: Arc<RwLock<AppState>>,
+        db_tx: DbSender,
     ) -> Result<Self> {
         Self::with_http(
             signer,
@@ -249,6 +269,7 @@ impl LiveOrderClient {
             maker_timeout_ms,
             state,
             build_http2_client()?,
+            db_tx,
         )
         .await
     }
@@ -260,6 +281,7 @@ impl LiveOrderClient {
         maker_timeout_ms: i64,
         state: Arc<RwLock<AppState>>,
         http: Client,
+        db_tx: DbSender,
     ) -> Result<Self> {
         let wallet = signer.maker().to_checksum(None);
         let post_template = build_request_template(ORDER_URL, &wallet, &creds, Method::POST)?;
@@ -279,7 +301,6 @@ impl LiveOrderClient {
         }
 
         Ok(Self {
-            signer: Arc::new(signer),
             shared: Arc::new(SharedClob {
                 creds,
                 http,
@@ -287,12 +308,63 @@ impl LiveOrderClient {
                 order_size_usdc,
                 maker_timeout_ms,
                 reprice_threshold: 0.02,
+                db_tx,
+                resubmit_tx: None,
+                post_template,
+                signer: Arc::new(signer),
             }),
-            post_template,
             delete_template,
             merge_client: None,
         })
     }
+}
+
+/// 解析 CLOB POST /order 的成功回执。字段缺失全部按默认值兜底，因为 Polymarket 在
+/// status=unmatched 时不会带 transactionsHashes / tradeIDs。
+fn parse_order_response_json(text: &str, elapsed_ms: u64) -> Result<PlaceOrderResult> {
+    let json: serde_json::Value = serde_json::from_str(text)?;
+    let order_id = json["orderID"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing orderID: {text}"))?
+        .to_string();
+    let order_status = json["status"].as_str().unwrap_or("unknown").to_string();
+    let making_amount = json["makingAmount"].as_str().and_then(|s| s.parse::<f64>().ok());
+    let taking_amount = json["takingAmount"].as_str().and_then(|s| s.parse::<f64>().ok());
+    let transactions_hashes = json["transactionsHashes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let trade_ids = json["tradeIDs"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let success = json["success"].as_bool().unwrap_or(true);
+    let error_msg = json["errorMsg"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    debug!(%order_id, %order_status, "order placed");
+    Ok(PlaceOrderResult {
+        order_id,
+        success,
+        status: order_status,
+        making_amount,
+        taking_amount,
+        transactions_hashes,
+        trade_ids,
+        error_msg,
+        elapsed: elapsed_ms,
+    })
+}
+
+#[inline]
+fn extract_error_msg(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("errorMsg")?
+        .as_str()
+        .map(String::from)
 }
 
 impl SharedClob {
@@ -306,7 +378,7 @@ impl SharedClob {
         let resp = self.http.execute(req).await?;
         let ttfb = t.elapsed();
         let status = resp.status();
-        let mut text = resp.text().await?;
+        let text = resp.text().await?;
         let body_read = t.elapsed() - ttfb;
         info!(
             ttfb_us = ?ttfb,
@@ -318,32 +390,31 @@ impl SharedClob {
         if status.as_u16() == 403 {
             anyhow::bail!("place order forbidden: {status}");
         }
+        // 400 / 5xx: 构造 success=false 的 PlaceOrderResult 而不是 bail，让上层入库 + 触发 resubmit。
         if !status.is_success() {
             debug!(%status, error = %text, "place_order failed");
-            anyhow::bail!("({status}) {text}");
+            let err_msg =
+                extract_error_msg(&text).unwrap_or_else(|| format!("({status}) {text}"));
+            return Ok(PlaceOrderResult {
+                success: false,
+                status: format!("http_{}", status.as_u16()),
+                error_msg: Some(err_msg),
+                elapsed: t.elapsed().as_millis() as u64,
+                ..Default::default()
+            });
         }
 
-        let json: serde_json::Value = serde_json::from_str(&text)?;
-        let order_id = json["orderID"]
-            .as_str()
-            .ok_or_else(|| anyhow!("missing orderID: {text}"))?
-            .to_string();
-        text.clear();
-        let order_status = json["status"].as_str().unwrap_or("unknown").to_string();
-        let filled_size = json["takingAmount"]
-            .as_str()
-            .and_then(|s| s.parse::<f64>().ok());
+        parse_order_response_json(&text, t.elapsed().as_millis() as u64)
+    }
 
-        debug!(%order_id, %order_status, "order placed");
-        Ok(PlaceOrderResult {
-            order_id,
-            success: true,
-            status: order_status,
-            filled_price: None,
-            filled_size,
-            error: None,
-            elapsed: t.elapsed().as_millis() as u64,
-        })
+    /// 签名 + POST /order：resubmit worker 直接复用。
+    pub async fn sign_and_post(&self, req: &PlaceOrderRequest) -> Result<PlaceOrderResult> {
+        let salt: u64 = rand::random();
+        let order = self.signer.build_order(req, salt, unix_ts_ms());
+        let sig = self.signer.sign_order(&order).await?;
+        let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
+        let template = clone_template(&self.post_template);
+        self.post_order(template, body).await
     }
 
     async fn delete_order(&self, template: reqwest::Request, order_id: &str) -> Result<bool> {
@@ -367,16 +438,169 @@ fn clone_template(t: &reqwest::Request) -> reqwest::Request {
     t.try_clone().expect("template body is None")
 }
 
+/// 下单瞬间冻结的"intent 侧"信息，用于 POST 异步回包后构造 my_orders 行。
+#[derive(Debug, Clone)]
+pub struct IntentSnapshot {
+    pub client_order_id: String,
+    pub side: PositionSide,
+    pub outcome: &'static str,
+    pub price: f64,
+    pub size: f64,
+    pub usd_value: f64,
+    pub order_type: &'static str,
+    pub token_id: String,
+    pub condition_id: String,
+    pub ts_ms: i64,
+    pub window_end_ts: i64,
+    pub reason: &'static str,
+}
+
+impl IntentSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    fn for_dispatch(
+        coid: &str,
+        intent: &BuyIntent,
+        token_id: &str,
+        size_shares: f64,
+        order_size_usdc: f64,
+        order_type: OrderType,
+        ts_ms: i64,
+        state: &AppState,
+    ) -> Self {
+        Self {
+            client_order_id: coid.to_string(),
+            side: intent.side,
+            outcome: match intent.side {
+                PositionSide::Up => "up",
+                PositionSide::Down => "down",
+            },
+            price: intent.target,
+            size: size_shares,
+            usd_value: order_size_usdc,
+            order_type: match order_type {
+                OrderType::Fak => "FAK",
+                OrderType::Gtc => "GTC",
+            },
+            token_id: token_id.to_string(),
+            condition_id: format!("0x{}", hex::encode(state.poly_condition_id.as_slice())),
+            ts_ms,
+            window_end_ts: state.poly_window_end_ts,
+            reason: match intent.reason {
+                PendingOrderReason::Chase => "chase",
+                PendingOrderReason::Rebalance => "rebal",
+            },
+        }
+    }
+}
+
+#[inline]
+fn fmt_amount(v: Option<f64>) -> Option<String> {
+    v.map(|x| format!("{x}"))
+}
+
+#[inline]
+fn fmt_str_vec(v: &[String]) -> Option<String> {
+    if v.is_empty() {
+        None
+    } else {
+        serde_json::to_string(v).ok()
+    }
+}
+
+pub fn build_order_row(
+    intent: &IntentSnapshot,
+    resp: &PlaceOrderResult,
+    attempt: u8,
+    parent_client_order_id: Option<String>,
+) -> MyOrderRow {
+    MyOrderRow {
+        client_order_id: intent.client_order_id.clone(),
+        parent_client_order_id,
+        attempt,
+        side: "buy",
+        outcome: intent.outcome,
+        price: intent.price,
+        size: intent.size,
+        usd_value: intent.usd_value,
+        order_type: intent.order_type,
+        token_id: intent.token_id.clone(),
+        condition_id: intent.condition_id.clone(),
+        ts_ms: intent.ts_ms,
+        timestamp: None,
+        window_end_ts: intent.window_end_ts,
+        reason: intent.reason,
+        success: resp.success,
+        order_id: if resp.order_id.is_empty() {
+            None
+        } else {
+            Some(resp.order_id.clone())
+        },
+        status: if resp.status.is_empty() {
+            None
+        } else {
+            Some(resp.status.clone())
+        },
+        making_amount: fmt_amount(resp.making_amount),
+        taking_amount: fmt_amount(resp.taking_amount),
+        transactions_hashes_json: fmt_str_vec(&resp.transactions_hashes),
+        trade_ids_json: fmt_str_vec(&resp.trade_ids),
+        error_msg: resp.error_msg.clone(),
+    }
+}
+
+/// 判定是否要进入 resubmit 链；满足则 send 到 shared.resubmit_tx。
+pub fn maybe_resubmit(
+    shared: &Arc<SharedClob>,
+    intent: &IntentSnapshot,
+    resp: &PlaceOrderResult,
+    requested_size: f64,
+    taking: f64,
+    attempt: u8,
+    parent_coid: &str,
+) {
+    let Some(tx) = shared.resubmit_tx.as_ref() else {
+        return;
+    };
+    if attempt >= MAX_RESUBMIT_ATTEMPTS {
+        return;
+    }
+    let (size_remaining, cumulative_filled) = if resp.success {
+        // 200 OK：未达请求量 → 把剩余量丢去重发
+        if taking <= 0.0 || taking >= requested_size {
+            return;
+        }
+        (requested_size - taking, taking)
+    } else {
+        // 400 / 5xx：整笔重发
+        (requested_size, 0.0)
+    };
+    if size_remaining < MIN_RESUBMIT_SHARES {
+        return;
+    }
+    let next_coid = format!("{parent_coid}-r{}", attempt + 1);
+    let req = ResubmitRequest {
+        client_order_id: next_coid,
+        parent_client_order_id: parent_coid.to_string(),
+        token_id: intent.token_id.clone(),
+        condition_id: intent.condition_id.clone(),
+        side: intent.side,
+        outcome: intent.outcome,
+        max_price: intent.price, // 不加价
+        size: size_remaining,
+        cumulative_filled,
+        original_size: requested_size,
+        attempt: attempt + 1,
+        ts_ms: intent.ts_ms,
+        window_end_ts: intent.window_end_ts,
+        reason: intent.reason,
+    };
+    let _ = tx.send(req);
+}
+
 #[async_trait]
 impl OrderClient for LiveOrderClient {
     async fn place_order(&self, req: PlaceOrderRequest) -> Result<PlaceOrderResult> {
-        let salt: u64 = rand::random();
-        let order = self.signer.build_order(&req, salt, unix_ts_ms());
-        let sig = self.signer.sign_order(&order).await?;
-        let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
-        self.shared
-            .post_order(clone_template(&self.post_template), body)
-            .await
+        self.shared.sign_and_post(&req).await
     }
 
     async fn cancel_order(&self, order_id: &str) -> Result<bool> {
@@ -421,11 +645,19 @@ impl OrderClient for LiveOrderClient {
         order.exchange_arrive_ts_ms = now_ms;
         order.updated_ts_ms = now_ms;
         let coid = order.client_order_id.clone();
+        let intent_snap = IntentSnapshot::for_dispatch(
+            &coid,
+            intent,
+            token_id,
+            size_shares,
+            self.shared.order_size_usdc,
+            order_type,
+            now_ms,
+            state,
+        );
         set_pending_order(state, intent.side, Some(order));
 
-        let signer = self.signer.clone();
         let shared = self.shared.clone();
-        let template = clone_template(&self.post_template);
         let side = intent.side;
         let req = PlaceOrderRequest {
             side: OrderSide::Buy,
@@ -434,29 +666,51 @@ impl OrderClient for LiveOrderClient {
             size_shares,
             order_type,
         };
-        let _ = reason;
+        let requested_size = size_shares;
         tokio::spawn(async move {
-            let result: Result<PlaceOrderResult> = async {
-                let salt: u64 = rand::random();
-                let order = signer.build_order(&req, salt, unix_ts_ms());
-                let sig = signer.sign_order(&order).await?;
-                let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
-                shared.post_order(template, body).await
-            }
-            .await;
+            let result = shared.sign_and_post(&req).await;
             let now = unix_ts_ms() as i64;
             match result {
                 Ok(resp) => {
-                    if let Ok(mut s) = shared.state.write() {
-                        if let Some(o) = pending_order_mut(&mut s, side) {
-                            if o.client_order_id == coid {
-                                o.order_hash = Some(resp.order_id.clone());
-                                o.status = OrderStatus::Accepted;
-                                o.updated_ts_ms = now;
+                    // 1. 落库
+                    let row = build_order_row(&intent_snap, &resp, 0, None);
+                    let _ = shared.db_tx.send(DbMsg::OrderRow(row));
+
+                    // 2. 推进 ledger 状态
+                    let taking = resp.taking_amount.unwrap_or(0.0);
+                    if resp.success {
+                        if let Ok(mut s) = shared.state.write() {
+                            if let Some(o) = pending_order_mut(&mut s, side) {
+                                if o.client_order_id == coid {
+                                    o.order_hash = Some(resp.order_id.clone());
+                                    o.status = OrderStatus::Accepted;
+                                    o.updated_ts_ms = now;
+                                }
                             }
                         }
+                        info!(?side, order_id = %resp.order_id, status = %resp.status, taking, "POST /order ok");
+                    } else {
+                        if let Ok(mut s) = shared.state.write() {
+                            let ours = pending_order(&s, side)
+                                .map(|o| o.client_order_id == coid)
+                                .unwrap_or(false);
+                            if ours {
+                                if let Some(o) = pending_order_mut(&mut s, side) {
+                                    o.mark_rejected(
+                                        now,
+                                        resp.error_msg
+                                            .clone()
+                                            .unwrap_or_else(|| resp.status.clone()),
+                                    );
+                                }
+                                clear_pending(&mut s, side);
+                            }
+                        }
+                        warn!(?side, status = %resp.status, error = ?resp.error_msg, "POST /order rejected");
                     }
-                    info!(?side, order_id = %resp.order_id, elapsed = resp.elapsed, "POST /order ok");
+
+                    // 3. Resubmit 判定（200 部分成交 / 400 失败）
+                    maybe_resubmit(&shared, &intent_snap, &resp, requested_size, taking, 0, &coid);
                 }
                 Err(e) => {
                     if let Ok(mut s) = shared.state.write() {
@@ -470,7 +724,7 @@ impl OrderClient for LiveOrderClient {
                             clear_pending(&mut s, side);
                         }
                     }
-                    warn!(?side, error = %e, "POST /order failed");
+                    warn!(?side, error = %e, "POST /order transport failed (no DB row written)");
                 }
             }
         });
