@@ -97,13 +97,8 @@ pub fn build_intents(
     last_taker_up_ts_ms: i64,
     last_taker_down_ts_ms: i64,
 ) -> (Vec<BuyIntent>, DecisionSideEffects) {
-    let in_excited = !snap.steady;
-    let in_chase_window = snap.expiry_min >= th.min_expiry_min_for_chase;
-    let in_rebal_window = snap.expiry_min >= th.min_expiry_min_for_rebal;
-
-    // 末段方向守门（方案 W）：距窗口末 < 1 分钟时，binance 已经远离 strike $30+ → 方向几乎锁定，
-    // 此时只允许 chase 赢家方，避免在末段押错方向后残仓 settle 全亏（线上实证 -$26/-$62）。
-    // binance 是领先源，poly MM 也是这么看的，跟着这个方向不会错。
+    // 末段方向守门（方案 W）：距窗口末 < 1 分钟时，binance 已经远离 strike $30+ → 方向几乎锁定。
+    // 此时只允许 jump 赢家方，避免在末段押错方向后残仓 settle 全亏。
     const LOCKIN_WINDOW_MIN: f64 = 1.0;
     const LOCKIN_USD_THRESHOLD: f64 = 30.0;
     let in_lockin = snap.expiry_min < LOCKIN_WINDOW_MIN;
@@ -111,112 +106,41 @@ pub fn build_intents(
     let lockin_blocks_up = in_lockin && binance_vs_k < -LOCKIN_USD_THRESHOLD;
     let lockin_blocks_down = in_lockin && binance_vs_k > LOCKIN_USD_THRESHOLD;
 
-    // v0.6 砍掉 chase（FV gap-based）—— 经实证 fee 吃掉 alpha 还产生残仓 settle 损失。
-    // 唯一 alpha 入口 = up_jump / down_jump（纯 binance jump 事件驱动）。
-    let up_chase = false;
-    let down_chase = false;
-    let _ = (fv, in_excited);  // suppress unused
-    let chase_side = None;
-
-    // v0.6 Pure Jump Capture: 纯事件触发，无 FV 校验，无 validation 等待。
-    //   - 不检查 fair_up - poly_mid（避免 FV 计算滞后）
-    //   - 不检查 jump_fresh 800ms（用 5s 全 confirm 窗口）—— snap.jump_fresh 已用 JUMP_CONFIRM_MS=5000
-    //   - 加 max_entry_price 0.65（已贵不进）
-    //   - 加 max_expiry_min 4.5（太早 jump 信息量不够预测 5min 后方向）
-    //   - 末段方向守门保留（W）：jump 末段押错方向 = -EV
-    // 设计意图：让"binance 涨了 → 立刻 IOC buy UP"这个动作毫秒不延迟，吃 poly book 反应迟缓的窗口。
+    // v0.6 Pure Jump Capture: 纯事件触发，唯一 alpha 入口。
+    //   - 不检查 FV gap（避免 FV 计算滞后）
+    //   - snap.jump_fresh 已用 JUMP_CONFIRM_MS=5000ms 窗口
+    //   - max_entry_price 0.65（已贵不进，asymmetric payoff）
+    //   - 1.5 ≤ expiry < 4.5 min（太早信号弱，太晚配平不及）
+    //   - lockin 守门避免末段押错方向
     const MAX_ENTRY_PRICE_JUMP: f64 = 0.65;
     const MAX_EXPIRY_MIN_JUMP: f64 = 4.5;
-    let jump_window_ok = in_chase_window && snap.expiry_min < MAX_EXPIRY_MIN_JUMP;
-    let up_jump = jump_window_ok
+    let in_jump_window =
+        snap.expiry_min >= th.min_expiry_min_for_chase && snap.expiry_min < MAX_EXPIRY_MIN_JUMP;
+    let up_jump = in_jump_window
         && snap.jump_fresh
         && snap.jump_dir == Some(1)
         && snap.up_ask > 0.0
         && snap.up_ask <= MAX_ENTRY_PRICE_JUMP
         && !lockin_blocks_up;
-    let down_jump = jump_window_ok
+    let down_jump = in_jump_window
         && snap.jump_fresh
         && snap.jump_dir == Some(-1)
         && snap.down_ask > 0.0
         && snap.down_ask <= MAX_ENTRY_PRICE_JUMP
         && !lockin_blocks_down;
 
-    // force-balance：只允许买"持仓 ≤ 对侧 + slack"的方向
-    let balance_ok_up = snap.qty_up <= snap.qty_down + th.force_balance_slack;
-    let balance_ok_down = snap.qty_down <= snap.qty_up + th.force_balance_slack;
+    // 节流：同侧 1s 一笔，避免同 jump 连续下多次
+    let jump_buy_up = up_jump && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms;
+    let jump_buy_down = down_jump && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms;
 
-    // chase 需要激变 + lead + force-balance + 1s 节流（与 origin/main 一致，不加 poly_fresh 守门）
-    let chase_buy_up = up_chase
-        && balance_ok_up
-        && in_excited
-        && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms;
-    let chase_buy_down = down_chase
-        && balance_ok_down
-        && in_excited
-        && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms;
+    // _fv 仅留作签名兼容（jump 路径不查 FV gap）
+    let _ = fv;
 
-    // JumpChase 走与 chase 同一节流（避免与 chase 同一 tick 重复下单）+ force-balance
-    let jump_buy_up = up_jump
-        && balance_ok_up
-        && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms
-        && !chase_buy_up;
-    let jump_buy_down = down_jump
-        && balance_ok_down
-        && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms
-        && !chase_buy_down;
+    let trigger_up = jump_buy_up;
+    let trigger_down = jump_buy_down;
 
-    // 偏仓配平：稳态也允许，无激变态/节流要求；窗口要求比 chase 宽，用来拯救已建偏仓。
-    let imbalanced_up_needed = snap.qty_down > snap.qty_up;
-    let imbalanced_dn_needed = snap.qty_up > snap.qty_down;
-    // v0.6 砍掉 rebal —— 没 SELL 时 rebal 等于"再买一笔反方向 hold to settle"，
-    // 多一笔 fee 还引入残仓风险。jump capture 直接 hold to settle，不配平。
-    let _ = (imbalanced_up_needed, imbalanced_dn_needed, in_rebal_window);
-    let rebalance_buy_up_path = false;
-    let rebalance_buy_down_path = false;
-
-    // 计算配平缺口用于展示和 qty 裁剪
-    let proj_up = snap.qty_up;
-    let proj_down = snap.qty_down;
-    let rebalance_qty_up = (proj_down - proj_up).max(0.0);
-    let rebalance_qty_down = (proj_up - proj_down).max(0.0);
-    let avg_after_up = weighted_avg(
-        snap.qty_up,
-        snap.avg_up,
-        rebalance_qty_up,
-        (snap.up_ask - 0.01).max(0.0),
-    ) + snap.avg_down;
-    let avg_after_down = snap.avg_up
-        + weighted_avg(
-            snap.qty_down,
-            snap.avg_down,
-            rebalance_qty_down,
-            (snap.down_ask - 0.01).max(0.0),
-        );
-
-    let trigger_up = chase_buy_up || jump_buy_up || rebalance_buy_up_path;
-    let trigger_down = chase_buy_down || jump_buy_down || rebalance_buy_down_path;
-
-    // chase 抓 lead alpha → 固定策略量；jump 抢 chainlink 跟随窗口 → 小仓试探；
-    // rebalance 配平 → 按真实缺口下单（兜 Polymarket 最低张数）。
-    // 优先级：chase > jump > rebalance（同侧并发时 chase 优先，与下方 reason 判定一致）。
-    let order_qty_up = if chase_buy_up {
-        th.chase_min_qty
-    } else if jump_buy_up {
-        th.jump_chase_qty
-    } else if rebalance_buy_up_path {
-        rebalance_qty_up.max(th.min_order_qty)
-    } else {
-        0.0
-    };
-    let order_qty_down = if chase_buy_down {
-        th.chase_min_qty
-    } else if jump_buy_down {
-        th.jump_chase_qty
-    } else if rebalance_buy_down_path {
-        rebalance_qty_down.max(th.min_order_qty)
-    } else {
-        0.0
-    };
+    let order_qty_up = if jump_buy_up { th.jump_chase_qty } else { 0.0 };
+    let order_qty_down = if jump_buy_down { th.jump_chase_qty } else { 0.0 };
 
     // pair-health 守门：建仓腿宽松 pair_health_max（对侧 ask proxy），配平腿用 rebal_health_max（对侧真实 avg）
     // 方案 Y：末段动态放宽。距窗口末 < 1 min 时，赢家方 ask 飞到 0.9+ 让正常配平守门拒掉，
@@ -262,91 +186,37 @@ pub fn build_intents(
         (opp_proxy + new_avg_down_after) < effective_pair_health_max
     };
 
-    let target_up = (fv.fair_up - th.safety_margin).max(0.0);
-    let target_down = (fv.fair_down - th.safety_margin).max(0.0);
-    // v0.6: JumpChase 不用 fv-based target 守门（fv 可能因 chainlink 滞后失真）。
-    // jump_buy_up/down 已经自己检查 up_ask <= 0.65。
-    // chase/rebal 已 disabled，保留下面这一行守门兼容历史（实际不会触发）。
+    // v0.6: 唯一路径 JumpChase。jump_buy_up/down 已经自己检查 up_ask <= 0.65。
     let want_buy_up = trigger_up && pair_health_ok_up;
     let want_buy_down = trigger_down && pair_health_ok_down;
-    let _ = (target_up, target_down, th.max_buy_price);
 
     let mut intents: Vec<BuyIntent> = Vec::with_capacity(2);
     if want_buy_up {
-        let reason = if chase_buy_up {
-            PendingOrderReason::Chase
-        } else if jump_buy_up {
-            PendingOrderReason::JumpChase
-        } else {
-            PendingOrderReason::Rebalance
-        };
-        // worst = IOC 走簿硬上限。
-        //   Chase: target + chase_worst_slippage（走簿 2c）
-        //   JumpChase v0.6: worst = up_ask 精确（**只吃 best_ask 一档**，不走簿），
-        //     避免薄盘 walk 多档把 alpha 吞了。target 也设为 ask（与 worst 一致表示我们就吃这价）。
-        //   Rebalance: 吃 merge 分水岭 (1 − avg_down) − head_room
-        let (intent_target_up, worst_up) = match reason {
-            PendingOrderReason::Chase => (target_up, target_up + th.chase_worst_slippage),
-            PendingOrderReason::JumpChase => (snap.up_ask, snap.up_ask),
-            PendingOrderReason::Rebalance => {
-                let w = ((1.0 - snap.avg_down) - th.rebal_worst_head_room).max(0.0);
-                (target_up, w)
-            }
-        };
+        // JumpChase: worst = up_ask 精确（只吃 best_ask 一档，不走簿）
         intents.push(BuyIntent {
             side: ChaseSide::Up,
             qty: order_qty_up,
-            target: intent_target_up,
-            worst: worst_up,
-            reason,
+            target: snap.up_ask,
+            worst: snap.up_ask,
+            reason: PendingOrderReason::JumpChase,
         });
     }
     if want_buy_down {
-        let reason = if chase_buy_down {
-            PendingOrderReason::Chase
-        } else if jump_buy_down {
-            PendingOrderReason::JumpChase
-        } else {
-            PendingOrderReason::Rebalance
-        };
-        let (intent_target_down, worst_down) = match reason {
-            PendingOrderReason::Chase => (target_down, target_down + th.chase_worst_slippage),
-            PendingOrderReason::JumpChase => (snap.down_ask, snap.down_ask),
-            PendingOrderReason::Rebalance => {
-                let w = ((1.0 - snap.avg_up) - th.rebal_worst_head_room).max(0.0);
-                (target_down, w)
-            }
-        };
         intents.push(BuyIntent {
             side: ChaseSide::Down,
             qty: order_qty_down,
-            target: intent_target_down,
-            worst: worst_down,
-            reason,
+            target: snap.down_ask,
+            worst: snap.down_ask,
+            reason: PendingOrderReason::JumpChase,
         });
     }
 
+    // v0.6: DecisionSideEffects 全部 None（chase_side / rebalance_hint 已废弃但
+    // 字段仍在以兼容 AppState/TUI 显示；保留 None 写入即可）
     let effects = DecisionSideEffects {
-        chase_side: if snap.steady { None } else { chase_side },
-        rebalance_hint_up: if rebalance_buy_up_path && rebalance_qty_up >= th.min_order_qty {
-            Some((rebalance_qty_up, avg_after_up))
-        } else {
-            None
-        },
-        rebalance_hint_down: if rebalance_buy_down_path && rebalance_qty_down >= th.min_order_qty {
-            Some((rebalance_qty_down, avg_after_down))
-        } else {
-            None
-        },
+        chase_side: None,
+        rebalance_hint_up: None,
+        rebalance_hint_down: None,
     };
     (intents, effects)
-}
-
-fn weighted_avg(old_qty: f64, old_avg: f64, add_qty: f64, add_price: f64) -> f64 {
-    let total = old_qty + add_qty;
-    if total > 0.0 {
-        (old_avg * old_qty + add_price * add_qty) / total
-    } else {
-        add_price
-    }
 }
