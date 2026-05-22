@@ -43,103 +43,68 @@ struct SubscribeCmd<'a> {
 }
 
 // === Public types ===
+//
+// 容器级 `#[serde(default)]`：任何字段缺失自动走 `Default::default()`，
+// 避免单字段缺失整条事件解析失败 —— 比每个字段挂 `#[serde(default)]` 干净一截。
 
 /// `event_type = "order"`：服务端在 PLACEMENT / UPDATE / CANCELLATION 时推送。
-/// 字段全用 `#[serde(default)]` 兜底，避免单字段缺失就整条解析失败。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UserOrderEvent {
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     pub owner: String,
-    #[serde(default)]
     pub market: String,
-    #[serde(default)]
     pub asset_id: String,
-    #[serde(default)]
     pub side: String,
-    #[serde(default)]
     pub price: String,
-    #[serde(default)]
     pub original_size: String,
-    #[serde(default)]
     pub size_matched: String,
-    #[serde(default)]
     pub status: String,
     /// PLACEMENT | UPDATE | CANCELLATION
-    #[serde(default, rename = "type")]
+    #[serde(rename = "type")]
     pub order_event_type: String,
-    #[serde(default)]
     pub order_type: String,
-    #[serde(default)]
     pub outcome: String,
-    #[serde(default)]
     pub timestamp: String,
-    #[serde(default)]
     pub expiration: Option<String>,
-    #[serde(default)]
     pub created_at: Option<String>,
-    #[serde(default)]
     pub maker_address: Option<String>,
-    #[serde(default)]
     pub associate_trades: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct MakerOrderInfo {
-    #[serde(default)]
     pub order_id: String,
-    #[serde(default)]
     pub owner: String,
-    #[serde(default)]
     pub matched_amount: String,
-    #[serde(default)]
     pub price: String,
-    #[serde(default)]
     pub asset_id: String,
-    #[serde(default)]
     pub outcome: String,
-    #[serde(default)]
     pub fee_rate_bps: Option<String>,
 }
 
 /// `event_type = "trade"`：MATCHED / MINED / CONFIRMED / RETRYING / FAILED。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UserTradeEvent {
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     pub taker_order_id: String,
-    #[serde(default)]
     pub market: String,
-    #[serde(default)]
     pub asset_id: String,
-    #[serde(default)]
     pub side: String,
-    #[serde(default)]
     pub size: String,
-    #[serde(default)]
     pub price: String,
-    #[serde(default)]
     pub status: String,
-    #[serde(default)]
     pub owner: String,
     /// TAKER | MAKER
-    #[serde(default)]
     pub trader_side: String,
-    #[serde(default)]
     pub timestamp: String,
-    #[serde(default)]
     pub fee_rate_bps: Option<String>,
-    #[serde(default)]
     pub matchtime: Option<String>,
-    #[serde(default)]
     pub last_update: Option<String>,
-    #[serde(default)]
     pub transaction_hash: Option<String>,
-    #[serde(default)]
     pub bucket_index: Option<i64>,
-    #[serde(default)]
     pub maker_orders: Vec<MakerOrderInfo>,
 }
 

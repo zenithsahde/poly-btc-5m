@@ -1,11 +1,5 @@
-//! Polymarket User-Channel 事件回灌：把 WS 的 trade / order 事件接到 ledger + my_orders / my_fills。
-//!
-//! 关键设计：
-//!   * `MATCHED` 入账：去重 → `AppState::apply_fill`（用 WS `fee_rate_bps` 真值）→ INSERT my_fills
-//!   * `MINED / CONFIRMED`：UPDATE my_fills 的 status + transaction_hash + last_update（ledger 不动）
-//!   * `FAILED / RETRYING`：忽略（按用户决策；接受 MATCHED 后链上失败的罕见 PnL 偏差）
-//!   * UserOrderEvent 当前只用作 ManagedOrder 状态推进 + my_orders 撤单回灌；
-//!     非阻塞主链路（成交以 trade 事件为准）。
+//! Polymarket User-Channel 事件回灌 ledger + my_orders / my_fills。
+//! MATCHED 入账，MINED/CONFIRMED 只更新链上字段，FAILED/RETRYING 忽略。
 
 use std::sync::{Arc, RwLock};
 
@@ -53,10 +47,9 @@ fn insert_matched(state: &Arc<RwLock<AppState>>, db_tx: &DbSender, t: &UserTrade
         return;
     };
     if !s.seen_fill_ids.insert(t.id.clone()) {
-        return; // 去重
+        return;
     }
 
-    // 1. asset_id → outcome
     let Some(outcome_side) = resolve_outcome(&s, &t.asset_id) else {
         warn!(asset_id = %t.asset_id, trade_id = %t.id, "user-ws fill: asset_id 不在当前两侧 token 中");
         return;
@@ -73,7 +66,6 @@ fn insert_matched(state: &Arc<RwLock<AppState>>, db_tx: &DbSender, t: &UserTrade
         return;
     }
 
-    // 2. ledger.apply_fill（fee 用 WS 真值，缺失 fallback 公式）
     let fee_bps = t.fee_rate_bps.as_deref().and_then(|s| s.parse::<f64>().ok());
     let is_maker = t.trader_side.eq_ignore_ascii_case("MAKER");
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -86,7 +78,7 @@ fn insert_matched(state: &Arc<RwLock<AppState>>, db_tx: &DbSender, t: &UserTrade
     let window_end_ts = s.poly_window_end_ts; // 在 write lock 上读出，避免后面再次借用
     s.apply_fill(
         outcome_side,
-        true, // buy_sell
+        true,
         is_maker,
         price,
         size,
@@ -98,7 +90,6 @@ fn insert_matched(state: &Arc<RwLock<AppState>>, db_tx: &DbSender, t: &UserTrade
         fee_bps,
     );
 
-    // 3. INSERT my_fills
     let row = MyFillRow {
         trade_id: t.id.clone(),
         taker_order_id: t.taker_order_id.clone(),
@@ -137,7 +128,7 @@ fn handle_order(state: &Arc<RwLock<AppState>>, db_tx: &DbSender, o: UserOrderEve
         });
     }
 
-    // 推进 ManagedOrder：trade 事件才是 PnL 来源，这里只更新 status / filled_qty 显示
+    // ManagedOrder 仅刷状态/filled_qty 用作展示；PnL 以 trade 事件为准
     let Ok(mut s) = state.write() else {
         return;
     };

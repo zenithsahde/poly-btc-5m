@@ -1,11 +1,4 @@
-//! FAK 部分成交 / 400 失败的重发链。
-//!
-//! 设计：
-//!   * 一条 mpsc 链：dispatch_buy_intent → resubmit_tx → run_resubmit_worker
-//!   * 每次重发自己也判定是否要再续一环（self_tx），attempt 上限 4
-//!   * 5m BTC 小额场景：整链不加价（`max_price` 始终 = 原 target）
-//!
-//! 不加价 tier 简化为常量；要分层调价时在 worker 入口加 tier 分发。
+//! FAK 部分成交 / 400 失败的重发链。整链不加价，attempt 上限 4。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,20 +11,13 @@ use crate::execution::transaction::{build_order_row, IntentSnapshot, SharedClob}
 use crate::position::PositionSide;
 use crate::web::db::DbMsg;
 
-/// 上限：首单 + 4 次重发 = 共 5 次尝试。
 pub const MAX_RESUBMIT_ATTEMPTS: u8 = 4;
-
-/// 单次重发的最小 size 阈值（shares）。低于则放弃，避免精度噪声 / 手续费白白浪费。
 pub const MIN_RESUBMIT_SHARES: f64 = 1.0;
-
-/// 重发节流。
 pub const RESUBMIT_SPACING_MS: u64 = 50;
 
 #[derive(Debug, Clone)]
 pub struct ResubmitRequest {
-    /// 本次重发新分配的 client_order_id（与 my_orders 主表对齐）
     pub client_order_id: String,
-    /// 上一环的 client_order_id（首次重发 = 原首单的 coid）
     pub parent_client_order_id: String,
     pub token_id: String,
     pub condition_id: String,
@@ -50,7 +36,6 @@ pub struct ResubmitRequest {
 pub type ResubmitSender = mpsc::UnboundedSender<ResubmitRequest>;
 pub type ResubmitReceiver = mpsc::UnboundedReceiver<ResubmitRequest>;
 
-/// 取出 `req` 中 IntentSnapshot 投回 my_orders 用的视图。
 fn snapshot_from(req: &ResubmitRequest) -> IntentSnapshot {
     IntentSnapshot {
         client_order_id: req.client_order_id.clone(),
@@ -75,7 +60,6 @@ pub async fn run_resubmit_worker(
 ) {
     info!("resubmit_worker started (max_attempts={})", MAX_RESUBMIT_ATTEMPTS);
     while let Some(req) = rx.recv().await {
-        // 节流：避免连续重发被风控/打挂
         tokio::time::sleep(Duration::from_millis(RESUBMIT_SPACING_MS)).await;
 
         let place_req = PlaceOrderRequest {
@@ -83,7 +67,7 @@ pub async fn run_resubmit_worker(
             token_id: req.token_id.clone(),
             price: req.max_price,
             size_shares: req.size,
-            order_type: OrderType::Fak, // resubmit 一律走 FAK（GTC 没必要 chase）
+            order_type: OrderType::Fak,
         };
         let attempt = req.attempt;
         let parent_coid = req.parent_client_order_id.clone();
@@ -108,7 +92,6 @@ pub async fn run_resubmit_worker(
                     taking,
                     "resubmit POST ok"
                 );
-                // 链式判定（resubmit_tx 用 self_tx 而非 shared 内的，避免循环依赖）
                 if attempt < MAX_RESUBMIT_ATTEMPTS {
                     if let Some(next) = build_next_request(&req, &resp, requested_size, taking) {
                         let _ = self_tx.send(next);
@@ -123,7 +106,6 @@ pub async fn run_resubmit_worker(
     warn!("resubmit_worker exit (channel closed)");
 }
 
-/// 复用 `maybe_resubmit` 的判定逻辑但产出 ResubmitRequest 而非 send；这里手动构造以便控制 self_tx。
 fn build_next_request(
     prev: &ResubmitRequest,
     resp: &PlaceOrderResult,
@@ -149,7 +131,7 @@ fn build_next_request(
         condition_id: prev.condition_id.clone(),
         side: prev.side,
         outcome: prev.outcome,
-        max_price: prev.max_price, // 不加价
+        max_price: prev.max_price,
         size: size_remaining,
         cumulative_filled,
         original_size: prev.original_size,
@@ -160,7 +142,7 @@ fn build_next_request(
     })
 }
 
-/// "abc-r1" → "abc"，避免 "abc-r1-r2" 这种叠后缀。
+// "abc-r1" → "abc"，避免叠后缀。
 #[inline]
 fn base_coid(s: &str) -> &str {
     s.rsplit_once("-r").map(|(base, _)| base).unwrap_or(s)
