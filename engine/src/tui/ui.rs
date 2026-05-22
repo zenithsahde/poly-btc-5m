@@ -28,7 +28,7 @@ use ratatui::{
 use std::sync::RwLock;
 
 use crate::position::{ManagedOrder, OrderStatus, PendingOrderReason, PositionSide, TradeRecord};
-use crate::tui::app::{AppState, ChaseSide};
+use crate::tui::app::AppState;
 
 #[derive(Default)]
 struct IocStats {
@@ -1047,11 +1047,8 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
     let down_mid = s.poly_down_mid();
     let float_up = s.ledger.position_up.float_pnl(up_mid);
     let float_down = s.ledger.position_down.float_pnl(down_mid);
-    let chase_str = match s.chase_side {
-        Some(ChaseSide::Up) => "UP",
-        Some(ChaseSide::Down) => "DOWN",
-        None => "—",
-    };
+    // v0.6: chase_side 字段已删（chase 路径已废）；TUI 显示固定 "—"
+    let chase_str = "—";
     let ioc = IocStats::from_orders(&s.ledger.order_history);
     let fills = WindowFillStats::from_trades(&s.ledger.trades_current_window);
 
@@ -1245,24 +1242,7 @@ fn render_position_panel(frame: &mut Frame, s: &AppState, area: ratatui::layout:
                 Style::default().fg(Color::Cyan),
             ),
         ]),
-        Line::from({
-            let up_hint = s
-                .ledger
-                .rebalance_hint_up
-                .map(|(qty, avg)| format!("UP需{:.0}张 若成交均价和={:.2}", qty, avg))
-                .unwrap_or_else(|| "—".to_string());
-            let down_hint = s
-                .ledger
-                .rebalance_hint_down
-                .map(|(qty, avg)| format!("DOWN需{:.0}张 若成交均价和={:.2}", qty, avg))
-                .unwrap_or_else(|| "—".to_string());
-            vec![
-                Span::raw("  配平 "),
-                Span::styled(up_hint, Style::default().fg(Color::DarkGray)),
-                Span::raw("  "),
-                Span::styled(down_hint, Style::default().fg(Color::DarkGray)),
-            ]
-        }),
+        // v0.6: rebalance_hint 字段已删（rebal 路径已废）；TUI 不再显示配平提示
         Line::from(vec![
             Span::raw("  IOC "),
             Span::styled(

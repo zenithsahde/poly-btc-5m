@@ -281,10 +281,6 @@ pub struct PositionLedger {
     pub cash_paid: f64,
     /// 上次 merge 时间戳（ms），用于节流
     pub last_merge_ts_ms: i64,
-    /// 配平提示 UP：(配平需多少张, 若全配平价后均价之和)
-    pub rebalance_hint_up: Option<(f64, f64)>,
-    /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
-    pub rebalance_hint_down: Option<(f64, f64)>,
 }
 
 impl PositionLedger {
@@ -614,8 +610,6 @@ impl PositionLedger {
             order.mark_expired(order.updated_ts_ms);
             self.order_history.push(order);
         }
-        self.rebalance_hint_up = None;
-        self.rebalance_hint_down = None;
     }
 
     pub fn settle_window_and_redeem(&mut self, strike_price: f64, binance_close: f64, ts_ms: i64) {

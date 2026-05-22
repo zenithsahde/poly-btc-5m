@@ -69,12 +69,8 @@ pub struct BuyIntent {
     pub reason: PendingOrderReason,
 }
 
-/// 面向 signal.rs 的辅助输出：决策过程中得到、但 signal.rs 还要写回 state 的展示字段
-pub struct DecisionSideEffects {
-    pub chase_side: Option<ChaseSide>,
-    pub rebalance_hint_up: Option<(f64, f64)>,
-    pub rebalance_hint_down: Option<(f64, f64)>,
-}
+/// 面向 signal.rs 的辅助输出（v0.6 后所有字段均废弃，保留空 struct 以兼容签名）
+pub struct DecisionSideEffects {}
 
 /// 核心决策函数：纯函数，无副作用
 pub fn build_intents(
@@ -193,12 +189,5 @@ pub fn build_intents(
         });
     }
 
-    // v0.6: DecisionSideEffects 全部 None（chase_side / rebalance_hint 已废弃但
-    // 字段仍在以兼容 AppState/TUI 显示；保留 None 写入即可）
-    let effects = DecisionSideEffects {
-        chase_side: None,
-        rebalance_hint_up: None,
-        rebalance_hint_down: None,
-    };
-    (intents, effects)
+    (intents, DecisionSideEffects {})
 }

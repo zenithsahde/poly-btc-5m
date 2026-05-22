@@ -557,12 +557,11 @@ impl SignalEngine {
                 self.last_taker_down_ts_ms,
             );
 
-            // 步骤 E：写展示副作用 + 用 IOC 走簿执行器立即成交每笔 BuyIntent。
-            // execute_ioc_buy：从 best_ask 逐档吃到 worst_price，剩余即撤（全 taker，不留挂单）。
+            // 步骤 E：用 IOC 走簿执行器立即成交每笔 BuyIntent。
+            // execute_ioc_buy：从 best_ask 逐档吃到 worst_price，剩余即撤（全 taker）。
+            // v0.6: DecisionSideEffects 已空，无副作用字段需要写回。
+            let _ = effects;
             if let Ok(mut s) = self.state.write() {
-                s.chase_side = effects.chase_side;
-                s.ledger.rebalance_hint_up = effects.rebalance_hint_up;
-                s.ledger.rebalance_hint_down = effects.rebalance_hint_down;
                 for intent in &intents {
                     let outcome = ioc::execute_ioc_buy(
                         &mut s,

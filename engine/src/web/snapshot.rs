@@ -130,9 +130,10 @@ pub fn build(state: &Arc<RwLock<AppState>>) -> DashboardSnapshot {
         inventory_value: s.inventory_value(),
         total_float_pnl: s.total_float_pnl(),
         net_pnl: s.net_pnl(),
-        chase_side: s.chase_side.map(chase_side_str),
-        rebalance_hint_up: s.ledger.rebalance_hint_up,
-        rebalance_hint_down: s.ledger.rebalance_hint_down,
+        // v0.6: chase_side / rebalance_hint 已废，shared-types 字段保留以兼容 web-ui 反序列化
+        chase_side: None,
+        rebalance_hint_up: None,
+        rebalance_hint_down: None,
         maker_buy_intent_up: managed_order_tuple(s.ledger.maker_buy_intent_up.as_ref()),
         maker_buy_intent_down: managed_order_tuple(s.ledger.maker_buy_intent_down.as_ref()),
         window_fill_rows: fills.fill_rows,

@@ -193,8 +193,6 @@ pub struct AppState {
     pub recent_poly_moves: VecDeque<(Instant, f64)>,
     /// --- 做市/仓位与成交 ---
     pub ledger: PositionLedger,
-    /// 当前可追涨侧（用于展示与浮亏减仓；UP 优先，若 UP 满足则显 UP）
-    pub chase_side: Option<ChaseSide>,
     /// Web UI PnL 曲线采样。30s 一个点，保留 2 天，用于浏览器晚连接后仍能看到历史走势。
     pub web_pnl_history: VecDeque<WebPnlPoint>,
     pub last_web_pnl_sample_secs: Option<u64>,
@@ -281,7 +279,6 @@ impl AppState {
             last_poly_mid: 0.0,
             recent_poly_moves: VecDeque::with_capacity(200), // ~5s at 40/s
             ledger: PositionLedger::default(),
-            chase_side: None,
             web_pnl_history: VecDeque::with_capacity(5760),
             last_web_pnl_sample_secs: None,
             chainlink_price: None,
@@ -472,10 +469,9 @@ impl AppState {
 
     /// 市场切换后：清零本窗口仓位与挂单意图，新 5 分钟窗口从零库存开始
     /// v0.4.3-5m：所有 P&L 字段统一为跨窗口累积（fee / rebate / cash_* / merge_pnl 全保留）
-    /// 仅清零物理上不能延续的字段（仓位/挂单/提示）—— 因为新窗口是新 token IDs，旧 qty 物理上失效
+    /// 仅清零物理上不能延续的字段（仓位/挂单）—— 因为新窗口是新 token IDs，旧 qty 物理上失效
     pub fn reset_inventory_for_new_window(&mut self) {
         self.ledger.reset_for_new_window();
-        self.chase_side = None;
         // v0.4.3-5m: total_fee / total_rebate / realized_pnl 不再 reset（跨窗口累积）
         // merged_pairs / merge_pnl / cash_received / cash_paid 仍跨窗口累积
     }
