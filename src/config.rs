@@ -1,8 +1,11 @@
 /// config.rs - 配置加载模块
-/// 从 config/default.toml + 环境变量中加载配置
+/// 从根目录 config.toml + 环境变量中加载配置
+/// 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
 use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
+
+pub use crate::execution::circuit_breaker::CircuitBreakerConfig;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExchangeConfig {
@@ -16,7 +19,6 @@ pub struct TradingConfig {
     pub symbol: String,
     pub streams: Vec<String>,
     pub poly_token_id: String,
-    pub wallet_address: String,
     /// 5m 公允价：行权价 K（未从 Poly 解析时使用）
     #[serde(default = "default_strike_price")]
     pub strike_price: f64,
@@ -30,6 +32,8 @@ pub struct TradingConfig {
     /// 稳态下用 Poly 反解 IV 时的 σ 上限（允许更高以便 FV 贴近 Poly 盘口，例如 5.0）
     #[serde(default = "default_sigma_max_poly")]
     pub volatility_sigma_max_poly: f64,
+    /// 每笔 BuyIntent 的下单名义额（USDC）；必填，无代码默认。qty_shares = order_size_usdc / target
+    pub order_size_usdc: f64,
 }
 
 fn default_strike_price() -> f64 { 96000.0 }
@@ -68,6 +72,21 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WalletConfig {
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_mode: crate::execution::signer::SignatureMode,
+    #[serde(default)]
+    pub builder_code: Option<String>,
+    /// Polygon RPC（pUSD 余额查询用）
+    #[serde(default)]
+    pub polygon_rpc_url: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub exchange: ExchangeConfig,
@@ -77,14 +96,18 @@ pub struct AppConfig {
     pub orderbook: OrderBookConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub wallet: Option<WalletConfig>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        // 配置加载优先级：default.toml < 环境变量
+        // 配置加载优先级：根目录 config.toml < 环境变量
         // 环境变量格式：APP__TRADING__SYMBOL=ETHUSDT（双下划线分隔层级）
         let config = Config::builder()
-            .add_source(File::with_name("config/default"))
+            .add_source(File::with_name("config"))
             .add_source(
                 Environment::with_prefix("APP")
                     .separator("__")

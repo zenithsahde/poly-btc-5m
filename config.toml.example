@@ -1,0 +1,77 @@
+# ──────────────────────────────────────────────
+# SJ Trading Engine - 配置模板
+# 用法：cp config.toml.example config.toml 后填写实盘密钥
+# 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
+#   e.g. APP__CIRCUIT_BREAKER__MAX_DAILY_LOSS=20
+# 注意：根目录 config.toml 已在 .gitignore，请勿提交私钥。
+# ──────────────────────────────────────────────
+
+[exchange]
+# 币安 WebSocket 端点
+ws_endpoint = "wss://stream.binance.com:9443"
+# 备用端点（低延迟节点，亚太区）
+ws_endpoint_alt = "wss://stream.binance.com:443"
+# REST API 端点
+rest_endpoint = "https://api.binance.com"
+
+[trading]
+# 交易对（支持多个，逗号分隔，但初始先单品种）
+symbol = "BTCUSDT"
+# 订阅的数据流
+streams = ["bookTicker", "depth@100ms", "aggTrade"]
+# Polymarket BTC Price (Yes) Token ID（每个 5m 窗口对应不同 token）
+poly_token_id = ""
+# 5m 公允价：行权价 K（未从 Poly 解析时使用）
+strike_price = 96000.0
+# 5m 公允价：波动率 σ 默认值（样本不足时）
+default_volatility_annual = 0.6
+# 波动率 σ 裁剪范围 [min, max]（粘性/默认时用）
+volatility_sigma_min = 0.1
+volatility_sigma_max = 2.0
+# 稳态下 Poly IV 的 σ 上限（用 Poly 反解时允许更高，使 FV 贴近盘口）
+volatility_sigma_max_poly = 5.0
+# 每笔 BuyIntent 的下单名义额（USDC）；qty_shares = order_size_usdc / target_price
+order_size_usdc = 100.0
+
+[websocket]
+ping_interval_secs = 20
+pong_timeout_secs = 10
+reconnect_base_ms = 1000
+reconnect_max_ms = 30000
+
+[latency]
+warn_threshold_ms = 10
+report_interval_secs = 10
+
+[orderbook]
+depth_levels = 20
+
+[api]
+# 推荐用环境变量注入：BINANCE_API_KEY=xxx / BINANCE_SECRET_KEY=xxx
+api_key = ""
+secret_key = ""
+
+[logging]
+# trace / debug / info / warn / error
+level = "info"
+
+[circuit_breaker]
+# 自动熔断：cash_pnl 亏损或连续下单错误超阈值后，永久阻止 LiveOrderClient 继续下单
+# （需重启进程恢复）。仅作用于实盘；dry-run/ExecutionSim 不受影响。
+enabled = true
+# 当日已实现 cash_pnl 亏损超过该 USDC 数额即熔断
+max_daily_loss = 50.0
+# 连续下单错误次数（rejected / transport failed）达到该值即熔断
+max_consecutive_errors = 5
+
+[wallet]
+# 钱包类型：eoa | safe | deposit_wallet
+signature_mode = "safe"
+# Polymarket 上的 funder 地址（safe / proxy）；EOA 模式下为 signer 地址本身
+wallet_address = "0x0000000000000000000000000000000000000000"
+# 实盘私钥（hex，0x 前缀）；留空 = dry-run 模式
+private_key = ""
+# 32-byte hex (0x-prefixed)；留空字符串视为 zero builder
+builder_code = ""
+# Polygon RPC URL（pUSD 余额查询用）
+polygon_rpc_url = "https://polygon-rpc.com"

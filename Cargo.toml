@@ -56,6 +56,9 @@ tokio-stream = "0.1"
 # 环境变量
 dotenvy = "0.15"
 
+# 命令行参数解析
+clap = { version = "4", features = ["derive"] }
+
 # TUI 面板
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -66,6 +69,36 @@ alloy-sol-types = { version = "0.8" }
 alloy-signer = { version = "0.5" }
 alloy-signer-local = { version = "0.5" }
 hex = "0.4"
+
+# Polygon RPC（pUSD 余额查询）
+alloy-provider = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-rpc-client = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-transport-http = { version = "0.5", default-features = false, features = ["reqwest"] }
+alloy-contract = { version = "0.5", default-features = false }
+# merge_positions 链上交易（EOA 路径构造 TransactionRequest / 发送 / 等回执）
+alloy-network = { version = "0.5", default-features = false }
+alloy-rpc-types-eth = { version = "0.5", default-features = false }
+
+# async trait（OrderClient）
+async-trait = "0.1"
+
+# L2 HMAC 鉴权（POLY_SIGNATURE）
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# 随机 salt
+rand = "0.8"
+
+# 字节缓冲（HTTP 请求体）
+bytes = "1"
+
+# 本地 SQLite 持久化（my_orders / my_fills / pnl_samples）
+# bundled = 自带 libsqlite3，免去系统依赖
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# FxHashSet（trade_id 去重）
+rustc-hash = "2"
 
 [profile.release]
 opt-level = 3

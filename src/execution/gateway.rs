@@ -1,7 +1,7 @@
 /// execution/gateway.rs - 自动化执行风控网关
 /// 负责在下单前的最后几毫秒进行逻辑校验，拦截风险行为
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct ExecutionGateway {
     /// 单笔最大金额限制 (USDT)

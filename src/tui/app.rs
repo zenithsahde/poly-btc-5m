@@ -5,7 +5,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use alloy_primitives::B256;
 use chrono::TimeZone;
+use rustc_hash::FxHashSet;
 
 /// 面板展示用的单条成交记录
 #[derive(Clone, Debug)]
@@ -55,6 +57,15 @@ pub struct DelayStats {
     pub sum_neg_ms: f64,
     pub min_neg_ms: f64,
     pub max_neg_ms: f64,
+}
+
+/// Web/SQLite PnL 时序采样点（每 30s 一帧）
+#[derive(Clone, Debug, Default)]
+pub struct WebPnlPoint {
+    pub uptime_secs: u64,
+    pub net_pnl: f64,
+    pub cash_pnl: f64,
+    pub inventory_value: f64,
 }
 
 /// 当前可追涨的一侧（UP/DOWN 不会同时涨）
@@ -211,8 +222,14 @@ pub struct AppState {
     pub poly_market_slug: String,
     /// 当前 Poly Token ID（切换市场时更新，供下单使用）
     pub poly_token_id: String,
+    /// 当前 Poly Token ID（DOWN 侧；live 模式下 DOWN 单要单独的 tokenId）
+    pub poly_down_token_id: String,
     /// 下一 5m 窗口切换时间戳 (Unix 秒)
     pub poly_window_end_ts: i64,
+    /// 当前市场 condition_id（链上 merge 入参；下单时也写入 my_orders.condition_id）
+    pub poly_condition_id: B256,
+    /// 是否实盘模式（LiveOrderClient 构造成功后置 true；dry-run / 仅干跑保持 false）
+    pub is_live_mode: bool,
     /// Poly Up 订单簿买盘（价格降序，最多 15 档）
     pub poly_bids: Vec<BookLevel>,
     /// Poly Up 订单簿卖盘（价格升序，最多 15 档）
@@ -254,10 +271,10 @@ pub struct AppState {
     pub realized_pnl: f64,
     /// 当前可追涨侧（用于展示与浮亏减仓；UP 优先，若 UP 满足则显 UP）
     pub chase_side: Option<ChaseSide>,
-    /// Maker 买意图：UP 侧 (挂单价, 数量, placed_ts_ms)：追涨 5 张，配平为计算出的配平量
-    pub maker_buy_intent_up: Option<(f64, f64, i64)>,
-    /// Maker 买意图：DOWN 侧 (挂单价, 数量, placed_ts_ms)
-    pub maker_buy_intent_down: Option<(f64, f64, i64)>,
+    /// 当前 pending Maker/Taker 买单（UP 侧）。dry-run 由 ExecutionSim 推进；实盘由 LiveOrderClient 写入。
+    pub pending_order_up: Option<crate::position::ManagedOrder>,
+    /// 当前 pending Maker/Taker 买单（DOWN 侧）
+    pub pending_order_down: Option<crate::position::ManagedOrder>,
     /// === v0.4.0-5m: Merge-based 经济模型字段 ===
     /// 累计已虚拟 merge 的对数（每对兑换 1.00 USDC）
     pub merged_pairs: f64,
@@ -269,10 +286,18 @@ pub struct AppState {
     pub cash_paid: f64,
     /// 上次 merge 时间戳（ms），用于节流
     pub last_merge_ts_ms: i64,
+    /// 上次窗口收盘 merge 上链的 tx hash（dry-run 始终为 None）
+    pub last_merge_tx_hash: Option<String>,
     /// 配平提示 UP：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_up: Option<(f64, f64)>,
     /// 配平提示 DOWN：(配平需多少张, 若全配平价后均价之和)
     pub rebalance_hint_down: Option<(f64, f64)>,
+    /// 已应用过的 trade_id 集合（User-WS MATCHED 去重，避免重投/快照重发双计 PnL）
+    pub seen_fill_ids: FxHashSet<String>,
+    /// Web/SQLite PnL 时序历史（30s 一帧，最多 5760 点 ≈ 2 天）
+    pub web_pnl_history: VecDeque<WebPnlPoint>,
+    /// 上次 PnL 采样的 uptime 秒数（节流到每 30s 一帧）
+    pub last_web_pnl_sample_secs: Option<u64>,
 }
 
 impl AppState {
@@ -311,7 +336,10 @@ impl AppState {
             snipe_threshold_bps: 12.0,
             poly_market_slug: "Finding...".to_string(),
             poly_token_id: String::new(),
+            poly_down_token_id: String::new(),
             poly_window_end_ts: 0,
+            poly_condition_id: B256::ZERO,
+            is_live_mode: false,
             poly_bids: Vec::new(),
             poly_asks: Vec::new(),
             poly_best_bid: 0.0,
@@ -337,16 +365,48 @@ impl AppState {
             total_rebate: 0.0,
             realized_pnl: 0.0,
             chase_side: None,
-            maker_buy_intent_up: None,
-            maker_buy_intent_down: None,
+            pending_order_up: None,
+            pending_order_down: None,
             merged_pairs: 0.0,
             merge_pnl: 0.0,
             cash_received: 0.0,
             cash_paid: 0.0,
             last_merge_ts_ms: 0,
+            last_merge_tx_hash: None,
             rebalance_hint_up: None,
             rebalance_hint_down: None,
+            seen_fill_ids: FxHashSet::default(),
+            web_pnl_history: VecDeque::new(),
+            last_web_pnl_sample_secs: None,
         }
+    }
+
+    /// 30s 节流的 PnL 采样：达到节流间隔时返回新一帧，否则返回 None。
+    /// 投递到 `DbMsg::PnlSample` 写入 SQLite。
+    pub fn record_web_pnl_sample(&mut self) -> Option<WebPnlPoint> {
+        const SAMPLE_SECS: u64 = 30;
+        const KEEP_POINTS: usize = 5760; // 2 days at 30s cadence
+
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        if let Some(last) = self.last_web_pnl_sample_secs {
+            if uptime_secs.saturating_sub(last) < SAMPLE_SECS {
+                return None;
+            }
+        }
+
+        let point = WebPnlPoint {
+            uptime_secs,
+            net_pnl: self.net_pnl(),
+            cash_pnl: self.cash_pnl(),
+            inventory_value: self.inventory_value(),
+        };
+        self.web_pnl_history.push_back(point.clone());
+        self.last_web_pnl_sample_secs = Some(uptime_secs);
+
+        while self.web_pnl_history.len() > KEEP_POINTS {
+            self.web_pnl_history.pop_front();
+        }
+        Some(point)
     }
 
     /// Poly 数据延迟（毫秒），无数据时返回 None
@@ -397,13 +457,21 @@ impl AppState {
     /// 若当前 Maker 买挂单均成交，UP 侧预估持仓量（用意图中的数量）
     pub fn projected_qty_up_after_intents(&self) -> f64 {
         self.position_up.qty
-            + self.maker_buy_intent_up.map(|(_, q, _)| q).unwrap_or(0.0)
+            + self
+                .pending_order_up
+                .as_ref()
+                .map(|o| o.remaining_qty())
+                .unwrap_or(0.0)
     }
 
     /// 若当前 Maker 买挂单均成交，DOWN 侧预估持仓量
     pub fn projected_qty_down_after_intents(&self) -> f64 {
         self.position_down.qty
-            + self.maker_buy_intent_down.map(|(_, q, _)| q).unwrap_or(0.0)
+            + self
+                .pending_order_down
+                .as_ref()
+                .map(|o| o.remaining_qty())
+                .unwrap_or(0.0)
     }
 
     /// 若当前 Maker 买挂单均成交，预估的仓位均价之和（用于配平与约束判断）
@@ -413,24 +481,26 @@ impl AppState {
             self.position_down.avg_price,
         );
         let (qty_up, qty_down) = (self.position_up.qty, self.position_down.qty);
-        let proj_avg_up = match self.maker_buy_intent_up {
-            Some((p, q, _)) => {
+        let proj_avg_up = match self.pending_order_up.as_ref() {
+            Some(o) => {
+                let q = o.remaining_qty();
                 let new_qty = qty_up + q;
                 if new_qty > 0.0 {
-                    (qty_up * avg_up + p * q) / new_qty
+                    (qty_up * avg_up + o.price * q) / new_qty
                 } else {
-                    p
+                    o.price
                 }
             }
             None => avg_up,
         };
-        let proj_avg_down = match self.maker_buy_intent_down {
-            Some((p, q, _)) => {
+        let proj_avg_down = match self.pending_order_down.as_ref() {
+            Some(o) => {
+                let q = o.remaining_qty();
                 let new_qty = qty_down + q;
                 if new_qty > 0.0 {
-                    (qty_down * avg_down + p * q) / new_qty
+                    (qty_down * avg_down + o.price * q) / new_qty
                 } else {
-                    p
+                    o.price
                 }
             }
             None => avg_down,
@@ -540,12 +610,19 @@ impl AppState {
         up_ask: f64,
         down_bid: f64,
         down_ask: f64,
+        fee_bps_override: Option<f64>,
     ) {
         debug_assert!(buy_sell, "v0.4.0-5m: apply_fill 只支持 buy；sell 由 apply_merge 处理");
         if !buy_sell { return; } // 防御性：永不执行 sell 分支
 
-        let p_clamped = price.clamp(0.0, 1.0);
-        let taker_fee = qty * 0.072 * p_clamped * (1.0 - p_clamped);
+        // 优先使用 WS 真值 fee_rate_bps；缺失则 fallback dry-run 公式（qty × 7.2bps × p × (1-p)）
+        let taker_fee = match fee_bps_override {
+            Some(bps) if bps > 0.0 => qty * price * (bps / 10_000.0),
+            _ => {
+                let p = price.clamp(0.0, 1.0);
+                qty * 0.072 * p * (1.0 - p)
+            }
+        };
         if maker_taker {
             self.total_rebate += taker_fee * 0.25;
         } else {
@@ -642,8 +719,8 @@ impl AppState {
     pub fn reset_inventory_for_new_window(&mut self) {
         self.position_up = Position::default();
         self.position_down = Position::default();
-        self.maker_buy_intent_up = None;
-        self.maker_buy_intent_down = None;
+        self.pending_order_up = None;
+        self.pending_order_down = None;
         self.chase_side = None;
         self.rebalance_hint_up = None;
         self.rebalance_hint_down = None;
@@ -651,30 +728,14 @@ impl AppState {
         // merged_pairs / merge_pnl / cash_received / cash_paid 仍跨窗口累积
     }
 
-    /// v0.4.3-5m: 窗口结算前的 redeem 模拟
-    ///   1. 先 force-merge 可配对部分（每对换 $1.00 USDC，避免输家边作废丢钱）
-    ///   2. 再按 BTC 真实方向把赢家边残仓 redeem（每张 $1.00 USDC）
-    ///   3. 输家边残仓直接清零（链上现实：作废）
-    /// 调用时机：窗口切换前一刻（poly_client.rs:switch_to_next_market）
+    // merge 由调用方在写锁外异步完成（on-chain 或 dry-run 虚拟），这里只处理胜出方赎回。
     pub fn settle_window_and_redeem(&mut self, binance_close: f64, ts_ms: i64) {
-        // (1) Force-merge 所有可配对（即使 avg_sum > 1 也 merge，因为 redeem 数学等价）
-        let pairs = self.mergeable_pairs();
-        if pairs > 0.0 {
-            let avg_sum = self.position_up.avg_price + self.position_down.avg_price;
-            self.merge_pnl += pairs * (1.0 - avg_sum);
-            self.cash_received += pairs * 1.0;
-            self.merged_pairs += pairs;
-            self.position_up.qty -= pairs;
-            self.position_down.qty -= pairs;
-            self.last_merge_ts_ms = ts_ms;
-            if self.position_up.qty <= 0.0 { self.position_up.avg_price = 0.0; }
-            if self.position_down.qty <= 0.0 { self.position_down.avg_price = 0.0; }
-        }
-        // (2) 残单边 redeem：按 BTC 是否高于 K 判定赢家
+        let _ = ts_ms;
+        // 残单边 redeem：按 BTC 是否高于 K 判定赢家
         if self.strike_price > 0.0 && binance_close > 0.0 {
             let up_wins = binance_close >= self.strike_price;
             if up_wins && self.position_up.qty > 0.0 {
-                // UP 赢：每张 $1.00（注意：cash_paid 已记入 buy 时的成本，所以净 = 1.00 - avg）
+                // UP 赢：每张 $1.00（cash_paid 已记入 buy 时的成本，所以净 = 1.00 - avg）
                 self.cash_received += self.position_up.qty * 1.0;
             } else if !up_wins && self.position_down.qty > 0.0 {
                 // DOWN 赢：每张 $1.00
