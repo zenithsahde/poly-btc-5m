@@ -16,7 +16,6 @@ pub struct TradingConfig {
     pub symbol: String,
     pub streams: Vec<String>,
     pub poly_token_id: String,
-    pub wallet_address: String,
     /// 5m 公允价：行权价 K（未从 Poly 解析时使用）
     #[serde(default = "default_strike_price")]
     pub strike_price: f64,
@@ -30,6 +29,8 @@ pub struct TradingConfig {
     /// 稳态下用 Poly 反解 IV 时的 σ 上限（允许更高以便 FV 贴近 Poly 盘口，例如 5.0）
     #[serde(default = "default_sigma_max_poly")]
     pub volatility_sigma_max_poly: f64,
+    // 每笔 BuyIntent 的下单名义额（USDC）；必须在 default.toml 配置，不提供代码默认。
+    pub order_size_usdc: f64,
 }
 
 fn default_strike_price() -> f64 {
@@ -78,6 +79,20 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WalletConfig {
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_mode: crate::execution::signer::SignatureMode,
+    // builder_code: 32-byte hex (0x-prefixed)，空字符串视为 zero builder。default.toml 必填。
+    pub builder_code: String,
+    // Polygon RPC URL，pUSD 余额查询用。default.toml 必填。
+    pub polygon_rpc_url: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub exchange: ExchangeConfig,
@@ -87,6 +102,8 @@ pub struct AppConfig {
     pub orderbook: OrderBookConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub wallet: Option<WalletConfig>,
 }
 
 impl AppConfig {
@@ -130,3 +147,4 @@ impl AppConfig {
         format!("{}/stream?streams={}", endpoint, stream_path)
     }
 }
+

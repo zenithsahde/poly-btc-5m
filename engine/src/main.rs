@@ -37,16 +37,26 @@ mod tui;
 mod web;
 mod ws;
 
+use alloy_primitives::Address;
 use cli::{Cli, Mode};
 use config::AppConfig;
+use execution::balance::BalanceProvider;
+use execution::client::OrderClient;
+use execution::sim::ExecutionSim;
+use execution::signer::{parse_builder_code, PolySigner};
+use execution::transaction::{build_http2_client, derive_api_key, ApiCreds, LiveOrderClient};
+use std::str::FromStr;
 use strategy::signal::SignalEngine;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tui::app::AppState;
 use ws::client::BinanceWsClient;
 use ws::poly_client::PolyWsClient;
 
 /// TUI 刷新率（毫秒）
 const TUI_REFRESH_MS: u64 = 50; // 20 FPS
+const MAIN_MAKER_TIMEOUT_MS: i64 = 5000;
+const MAIN_SIM_SUBMIT_LATENCY_MS: i64 = 45;
+const MAIN_SIM_CANCEL_LATENCY_MS: i64 = 45;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +65,94 @@ async fn main() -> Result<()> {
 
     // ── 1. 加载配置 ────────────────────────────────────────────
     let _ = dotenvy::dotenv();
-    let cfg = AppConfig::load()?;
+    let mut cfg = AppConfig::load()?;
+
+    // ── 1b. 区分 dry-run / 实盘模式 ────────────────────────────
+    let private_key = cfg
+        .wallet
+        .as_ref()
+        .and_then(|w| w.private_key.as_deref())
+        .filter(|s| !s.is_empty());
+    let signature_mode = cfg
+        .wallet
+        .as_ref()
+        .map(|w| w.signature_mode)
+        .unwrap_or_default();
+    let wallet_address = cfg
+        .wallet
+        .as_ref()
+        .and_then(|w| w.wallet_address.as_deref())
+        .and_then(|s| Address::from_str(s).ok())
+        .unwrap_or(Address::ZERO);
+    let builder_code = parse_builder_code(
+        cfg.wallet
+            .as_ref()
+            .map(|w| w.builder_code.as_str())
+            .unwrap_or(""),
+    );
+
+    // state 提前到此处构造，以便注入 LiveOrderClient
+    let state = Arc::new(RwLock::new(AppState::new(&cfg.trading.symbol)));
+
+    let order_client: Arc<dyn OrderClient> = if let (false, Some(pk)) =
+        (cli.dry_run, private_key)
+    {
+        let signer = PolySigner::new(pk, signature_mode, wallet_address, builder_code)?;
+        info!(
+            "Live mode: type={:?} maker={:?} signer={:?}",
+            signer.signature_type(),
+            signer.maker(),
+            signer.order_signer()
+        );
+
+        let http = build_http2_client()?;
+        let (api_key, secret, passphrase) = derive_api_key(&signer, &http).await?;
+        info!(
+            "API key derived: {}…",
+            api_key.get(..8).unwrap_or(&api_key)
+        );
+        let creds = ApiCreds::new(&api_key, &secret, &passphrase)?;
+
+        let rpc_url = cfg
+            .wallet
+            .as_ref()
+            .map(|w| w.polygon_rpc_url.as_str())
+            .unwrap_or("");
+        match BalanceProvider::new(rpc_url, signer.maker()) {
+            Ok(bal) => match bal.fetch_micro_usdc().await {
+                Ok(m) => info!("pUSD balance: {:.4} USDC", m as f64 / 1_000_000.0),
+                Err(e) => warn!("pUSD balance fetch failed: {:?}", e),
+            },
+            Err(e) => warn!("BalanceProvider init failed: {:?}", e),
+        }
+
+        warn!("Live 模式：无 WS fill listener，GTC 挂单成交不会回流 PnL；先用小额 order_size_usdc 验。");
+
+        let live = LiveOrderClient::with_http(
+            signer,
+            creds,
+            cfg.trading.order_size_usdc,
+            MAIN_MAKER_TIMEOUT_MS,
+            Arc::clone(&state),
+            http,
+        )
+        .await?;
+        Arc::new(live)
+    } else {
+        if cli.dry_run {
+            info!("Dry-run mode forced by --dry-run flag");
+        } else {
+            warn!("[wallet].private_key not set — dry-run mode");
+        }
+        Arc::new(ExecutionSim::new(
+            MAIN_SIM_SUBMIT_LATENCY_MS,
+            MAIN_SIM_CANCEL_LATENCY_MS,
+            MAIN_MAKER_TIMEOUT_MS,
+        ))
+    };
+    if let Some(w) = cfg.wallet.as_mut() {
+        w.private_key = None;
+    }
 
     // ── 2. 日志（避免与 TUI 冲突）──────────────────────────────
     // 若设置 RUST_LOG=info|debug，则开启日志。默认 stderr；若设置 ENGINE_LOG_FILE=路径 则写入该文件便于排查
@@ -93,8 +190,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── 3. 创建共享状态 ────────────────────────────────────────
-    let state = Arc::new(RwLock::new(AppState::new(&cfg.trading.symbol)));
+    // ── 3. 初始化 strike_price（state 已在步骤 1b 提前构造）──────
     if let Ok(mut s) = state.write() {
         s.strike_price = cfg.trading.strike_price;
     }
@@ -191,7 +287,7 @@ async fn main() -> Result<()> {
     };
 
     // ── 6. 启动策略引擎 task（仅行情写入状态，无下单）────────────────
-    let signal_engine = SignalEngine::new(cfg, Arc::clone(&state));
+    let signal_engine = SignalEngine::new(cfg, Arc::clone(&state), Arc::clone(&order_client));
     let strategy_task = tokio::spawn(async move {
         signal_engine.run(event_rx).await;
     });

@@ -66,6 +66,7 @@ impl PolyWsClient {
         if let Ok(mut s) = state.write() {
             s.poly_market_slug = initial.slug.clone();
             s.poly_token_id = initial.up_token_id.clone();
+            s.poly_down_token_id = initial.down_token_id.clone();
             s.poly_window_end_ts = initial.window_end_ts;
         }
         Self {
@@ -328,6 +329,7 @@ impl PolyWsClient {
             }
             s.poly_market_slug = new_market.slug.clone();
             s.poly_token_id = new_market.up_token_id.clone();
+            s.poly_down_token_id = new_market.down_token_id.clone();
             s.poly_window_end_ts = new_market.window_end_ts;
             s.strike_price = if let Some(k_cl) = strike_from_chainlink {
                 info!(
