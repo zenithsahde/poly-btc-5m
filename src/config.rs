@@ -16,7 +16,6 @@ pub struct TradingConfig {
     pub symbol: String,
     pub streams: Vec<String>,
     pub poly_token_id: String,
-    pub wallet_address: String,
     /// 5m 公允价：行权价 K（未从 Poly 解析时使用）
     #[serde(default = "default_strike_price")]
     pub strike_price: f64,
@@ -68,6 +67,18 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WalletConfig {
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_mode: crate::execution::signer::SignatureMode,
+    #[serde(default)]
+    pub builder_code: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub exchange: ExchangeConfig,
@@ -77,6 +88,8 @@ pub struct AppConfig {
     pub orderbook: OrderBookConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub wallet: Option<WalletConfig>,
 }
 
 impl AppConfig {
