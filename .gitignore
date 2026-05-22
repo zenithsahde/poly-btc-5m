@@ -2,6 +2,7 @@
 target/
 *.lock.bak
 web-ui/dist/
+web-ui/Cargo.lock
 
 # Trading data outputs (regenerated each run)
 trades/
@@ -9,6 +10,13 @@ orders/
 fv_snapshots/
 excited_snapshots/
 snapshots_30ms/
+
+# Deploy markers + verification CSV
+.deployed-sha
+verify_chainlink_fv*.csv
+*.csv
+verify-venv/
+webui_db/
 
 # Logs
 *.log

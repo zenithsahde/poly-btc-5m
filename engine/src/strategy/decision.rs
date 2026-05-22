@@ -45,31 +45,19 @@ pub struct MarketSnapshot {
     pub strike: f64,
 }
 
-/// 决策守门与 worst_price 参数；与 signal.rs 的常量同源，集中在一处便于调参
+/// 决策守门与 worst_price 参数（v0.6 瘦身：只留 JumpChase 路径用的字段）
 pub struct Thresholds {
-    pub chase_gap_min: f64,
-    pub safety_margin: f64,
-    pub chase_worst_slippage: f64,
-    /// JumpChase 腿允许的 worst-target 滑点。比 chase 大（4c vs 2c），因为
-    /// 抢 chainlink 跟随 binance 的 5s alpha 时机珍贵，吃稍贵的档可接受。
-    pub jump_worst_slippage: f64,
-    /// JumpChase 触发的最小 FV-poly_mid 错价（cent）。
-    /// 比 chase_gap_min 低（3c vs 10c）：因为 chainlink 已经"快要追上 binance" 是高确信信号，
-    /// 不需要等 FV 完全 dominate poly_mid 才下手。
-    pub jump_chase_gap_min: f64,
-    /// JumpChase 单笔基础张数（小仓抢跑）。
+    /// JumpChase 单笔基础张数。
     pub jump_chase_qty: f64,
-    pub rebal_worst_head_room: f64,
-    pub pair_health_max: f64,
-    pub rebal_health_max: f64,
-    pub max_buy_price: f64,
-    pub chase_min_qty: f64,
+    /// Polymarket 最低订单数量（5 张）。用于 ioc 内部检查。
     pub min_order_qty: f64,
+    /// jump_window 下界（min）：剩余 < 此值禁 jump，避免末段建仓没时间消化。
     pub min_expiry_min_for_chase: f64,
-    pub min_expiry_min_for_rebal: f64,
+    /// 同侧 taker buy 节流间隔（ms）：避免同一 jump 信号触发多次。
     pub taker_buy_interval_ms: i64,
-    pub force_balance_slack: f64,
-    pub chase_only_in_excited: bool,
+    /// pair_health 守门：建仓腿对侧空仓时，fill 后 (new_avg + opp_ask) 上限。
+    /// 末段动态放宽到 1.20（见 build_intents 内 LOCKIN_PAIR_HEALTH_MAX）。
+    pub pair_health_max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -142,17 +130,10 @@ pub fn build_intents(
     let order_qty_up = if jump_buy_up { th.jump_chase_qty } else { 0.0 };
     let order_qty_down = if jump_buy_down { th.jump_chase_qty } else { 0.0 };
 
-    // pair-health 守门：建仓腿宽松 pair_health_max（对侧 ask proxy），配平腿用 rebal_health_max（对侧真实 avg）
-    // 方案 Y：末段动态放宽。距窗口末 < 1 min 时，赢家方 ask 飞到 0.9+ 让正常配平守门拒掉，
-    // 残仓 settle 全亏。末段放宽到 lockin_rebal_health_max=1.20：哪怕配平时锁住一点亏，
-    // 也比残仓 settle 0 redeem 强（数学上残仓 cost > 0 时配平永远更优）。
-    const LOCKIN_REBAL_HEALTH_MAX: f64 = 1.20;
+    // pair-health 守门：fill 后 avg_sum 上限。
+    // 静态时 1.02（保证 merge 至少锁 −2c 净亏即可接受，因为 jump 后大概率还会反向 jump 配对）；
+    // 末段（< 1 min）放宽到 1.20，让赢家方贵的时候也能配上、把残仓拉回 merge 配对路径。
     const LOCKIN_PAIR_HEALTH_MAX: f64 = 1.20;
-    let effective_rebal_health_max = if in_lockin {
-        LOCKIN_REBAL_HEALTH_MAX
-    } else {
-        th.rebal_health_max
-    };
     let effective_pair_health_max = if in_lockin {
         LOCKIN_PAIR_HEALTH_MAX
     } else {
@@ -169,8 +150,9 @@ pub fn build_intents(
     } else {
         snap.down_ask
     };
+    // 对侧若已有持仓用真实 avg；空仓用 ask 作 proxy。两路径都用同一 effective_pair_health_max。
     let pair_health_ok_up = if snap.qty_down > 0.0 {
-        (new_avg_up_after + snap.avg_down) < effective_rebal_health_max
+        (new_avg_up_after + snap.avg_down) < effective_pair_health_max
     } else {
         let opp_proxy = if snap.down_ask > 0.0 {
             snap.down_ask
@@ -180,7 +162,7 @@ pub fn build_intents(
         (new_avg_up_after + opp_proxy) < effective_pair_health_max
     };
     let pair_health_ok_down = if snap.qty_up > 0.0 {
-        (snap.avg_up + new_avg_down_after) < effective_rebal_health_max
+        (snap.avg_up + new_avg_down_after) < effective_pair_health_max
     } else {
         let opp_proxy = if snap.up_ask > 0.0 { snap.up_ask } else { 0.5 };
         (opp_proxy + new_avg_down_after) < effective_pair_health_max

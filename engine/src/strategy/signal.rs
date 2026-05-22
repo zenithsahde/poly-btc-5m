@@ -39,82 +39,36 @@ const CATCHUP_EPSILON: f64 = 0.03;
 const POLY_MOVE_THRESH: f64 = 0.03;
 /// 领先超时：超过此时长未跟上则丢弃本次 lead。15m=30s → 5m=10s（10s 已是 5m 的 1/30，足够）
 const LEAD_TIMEOUT_MS: u64 = 10_000;
-/// 追涨门槛：FV 比 Poly 高 ≥ 10 美分（v0.4.8 从 7c 提到 10c）
-/// 回测 472K 行实证：gap=0.07 fee=$102 PnL=+$308；gap=0.10 fee=$52 PnL=+$329。fee 减半，PnL +7%
-/// 底层逻辑：force-balance 在 BTC 单向走时强制配对追贵对侧，gap 越严越能过滤"假 lead"
-const CHASE_GAP_MIN: f64 = 0.10;
-/// 追涨侧买单数量（张）—— Polymarket 强制 5 张最低。
-/// v0.5.1: 100 → 30。数据复盘：100 张 chase 下后 Poly 反向 ask 在 rebal worst 价位的
-/// 累计深度往往 < 100 张（实盘 1779295200 窗口 96 笔 rebal worst_breach、1779297000 窗口
-/// 4 笔 rebal ioc_remainder），导致单边 100 张残仓 → settle 输 -$26/-$62。
-/// 30 张更容易被反方向 rebal 同步配上；缺点是 alpha 单笔捕获减小 70%，但配对率显著提升。
-const MAKER_BUY_CHASE_MIN_QTY: f64 = 30.0;
-/// Polymarket 最低订单数量（张）。配平缺口低于该值时跳过，避免实盘拒单。
+/// Polymarket 最低订单数量（张）。
 const MIN_ORDER_QTY: f64 = 5.0;
-/// Merge 触发：可配对张数 ≥ 此值时进行虚拟 merge（凑够 5 对再 merge，省 gas 但模拟里无此约束）
+/// Merge 触发：可配对张数 ≥ 此值时进行虚拟 merge
 const MERGE_TRIGGER_PAIR_QTY: f64 = 1.0;
 /// Merge 节流：两次 merge 至少间隔此毫秒数
 const MERGE_INTERVAL_MS: i64 = 1000;
 
-/// 追涨仅在激变态下进行：稳态时不挂追涨单、不保留追涨侧，避免在无波动时误建仓
-const CHASE_ONLY_IN_EXCITED: bool = true;
-
-/// 同侧 taker buy 最小间隔（防止每帧 BookTicker 触发暴买）
+/// 同侧 taker buy 最小间隔（jump 触发后 1s 内不重复下单）
 const TAKER_BUY_INTERVAL_MS: i64 = 1000;
 
-// ── P0 三守门（v0.4.1-5m 引入，防止 100 张档尾部风险灾难）──
-/// 单边追涨/配平价格上限。> 0.85 价位的"几乎确定"赌局风险:收益不对称（1c edge vs 49:1 损失），
-/// 一笔可吞 40 个健康窗口的累积。挂价超此值时拒绝建仓。
+/// 单边买入价格上限（建仓守门）。
+/// > 0.85 价位的"几乎确定"赌局风险收益不对称（1c edge vs 49:1 损失）。
 const MAX_BUY_PRICE: f64 = 0.85;
-/// v0.4.6 force-balance（E0）：chase 时只允许买"持仓 ≤ 对侧" 的方向。
-/// 回测实证：E0 把 PnL 从 -$1501 提升到 +$110，最大单窗口回撤从 -$1216 降到 -$43。
-/// 底层逻辑：lead alpha 是单边瞬时优势，但反复追同一边会累积 avg_sum > 1 的"半死对"。
-/// 强制配平 = 每笔 chase 必然配对，把 lead alpha 100% 转化为 merge 套利空间。
-const FORCE_BALANCE_SLACK: f64 = 0.0;
-/// 健康对守门（C2 cost-aware）：建仓腿（对侧空仓）fill 后 avg_sum < 此值。
-/// 用对侧 ask 作 proxy。
-/// v0.4.10 设 1.05，留宽容纳 lead alpha；但 [0.98, 1.05] 与 REBAL_HEALTH_MAX(0.98)
-/// 形成 trap zone：chase 建得了仓但 rebalance 接不住，单边裸损（线上实证 -$33.89）。
-/// v0.5.0 收紧到 1.02：紧贴 0.98 + 4c spread+fee buffer，保证 chase 后 rebalance 永远能补。
+
+/// 健康对守门（建仓腿对侧空仓）：fill 后 avg_sum < 此值才允许下单。
+/// 1.02 = REBAL_HEALTH_MAX(0.98) + 4c spread+fee buffer。
+/// 末段（< 1 min）由 decision.rs 动态放宽到 1.20，避免赢家方贵时配不上。
 const PAIR_HEALTH_MAX: f64 = 1.02;
-/// v0.4.14 配平腿严格守门：对侧已有持仓时 fill 后 avg_sum < 0.98
-/// 用真实 avg 计算（不用 ask proxy）。0.98 = 留 2c 给 fee + 滑点，余下 ≥ 2c 锁定净利。
-/// 防 v0.4.13 看到的"avg_sum 漂到 1.01 卡死 merge"动态滞后 bug。
-const REBAL_HEALTH_MAX: f64 = 0.98;
-/// v0.4.11 Marketable Limit Order: 建仓腿目标价 = FV - SAFETY_MARGIN（吃 lead alpha）
-/// 历史回测 1.2M 行：margin=0.05 → PnL +$978（vs v0.4.10 +$222，4x 提升）。
-/// 上调 0.05→0.06：与 CHASE_WORST_SLIPPAGE 联动把 worst 压到 FV-4c，加宽抗 FV 高估的垫子。
-const SAFETY_MARGIN: f64 = 0.06;
-/// IOC 走簿：chase 腿允许吃簿到 target + 此滑点（cent）。
-/// 上限 = CHASE_GAP_MIN(10c) - SAFETY_MARGIN(6c) = 4c 容差，砍一半 = 2c。
-const CHASE_WORST_SLIPPAGE: f64 = 0.02;
-/// IOC 走簿：JumpChase 腿允许的更宽滑点（cent）。
-/// 数据实证（5 窗口 220 事件）：binance ±$30/1s 后 chainlink 5s 内追上 ~126% pass-through，
-/// 同向 97%。alpha 窗口窄到只有几秒，吃簿稍贵也接受；4c 兜底 = CHASE_GAP_MIN(10c) - SAFETY_MARGIN(6c)。
-const JUMP_WORST_SLIPPAGE: f64 = 0.04;
-/// JumpChase 触发：1s 内 binance mid 变化 ≥ 此美元数（绝对值）。
-/// v0.6 改为 $15（原 $30）：calm market 下 $30 一晚 0 触发（实证），降到 $15
-/// 才有足够频率（~30-50 次/天）让 alpha 启用。pass-through 在 $15 阈值下仍有正信号。
+
+/// JumpChase 触发：1s 内 binance mid 变化 ≥ 此美元数。
+/// v0.6 改为 $15（原 $30）：calm market 下 $30 一晚 0 触发。降到 $15 有足够频率。
 const JUMP_USD_THRESHOLD: f64 = 15.0;
-/// JumpChase 回看窗口：取 binance_mid_history 在过去这个毫秒内的最早样本作起点。
+/// JumpChase 回看窗口：取 binance_mid_history 过去这个毫秒内的最早样本作起点。
 const JUMP_LOOKBACK_MS: i64 = 1_000;
-/// JumpChase confirm 窗口：触发后这么久仍可下单。
-/// v0.5.5：与 spot_s jump-correction decay 5s 窗口对齐。
-/// 在这 5s 内 spot_s = chainlink + jump×decay，FV 仍处于"预测后 chainlink"状态，
-/// jump_chase 应该继续允许下单 ride 这个 alpha。
+/// JumpChase confirm 窗口：触发后这么久仍可下单。与 spot_s jump-correction 5s 衰减对齐。
 const JUMP_CONFIRM_MS: i64 = 5_000;
-/// JumpChase 单笔基础张数。v0.6 = 15 张（原 5）。
-/// 数学：15 × max_entry_price 0.65 = $9.75 单笔最大损失，仍可控；
-/// 15 张配合 top-of-book 取量（受限于盘口深度），实际成交可能更少。
+/// JumpChase 单笔基础张数。15 × 0.65 = $9.75 单笔最大损失。
 const JUMP_CHASE_QTY: f64 = 15.0;
-/// IOC 走簿：配平腿 worst = (1 - opp.avg) - 此预算。
-/// 与 REBAL_HEALTH_MAX=0.98 严格对齐：吃完后 avg_sum < 0.98，每对 merge 至少锁 2c 利润。
-const REBAL_WORST_HEAD_ROOM: f64 = 0.02;
-/// 距窗口结束 < 此分钟数时停止新建 chase 仓。
-/// v0.4.15: 0.5 → 1.5，避免末段建仓导致单边卡死。
+/// jump_window 下界：距窗口末 < 此分钟数时禁 jump。
 const MIN_EXPIRY_MIN_FOR_CHASE: f64 = 1.5;
-/// 距窗口结束 < 此分钟数时配平腿仍允许，拯救已建仓偏仓。
-const MIN_EXPIRY_MIN_FOR_REBAL: f64 = 0.5;
 /// Poly WS 数据新鲜度守门：距上次 poly 事件超过此毫秒则禁止建仓。
 /// 1500ms 来自 lead P95=2.4s；Poly 静默超 1.5s 说明 WS 中断或 token 未订阅，
 /// 基于陈旧 best 价走簿会打穿 worst_price 拿到错误 fill。
@@ -584,26 +538,16 @@ impl SignalEngine {
                 }
             };
 
-            // 步骤 D：纯函数 decision::build_intents → 0~2 笔 BuyIntent + 展示副作用
+            // 步骤 D：纯函数 decision::build_intents → 0~2 笔 BuyIntent
             let thresholds = Thresholds {
-                chase_gap_min: CHASE_GAP_MIN,
-                safety_margin: SAFETY_MARGIN,
-                chase_worst_slippage: CHASE_WORST_SLIPPAGE,
-                jump_worst_slippage: JUMP_WORST_SLIPPAGE,
-                jump_chase_gap_min: 0.03,
                 jump_chase_qty: JUMP_CHASE_QTY,
-                rebal_worst_head_room: REBAL_WORST_HEAD_ROOM,
-                pair_health_max: PAIR_HEALTH_MAX,
-                rebal_health_max: REBAL_HEALTH_MAX,
-                max_buy_price: MAX_BUY_PRICE,
-                chase_min_qty: MAKER_BUY_CHASE_MIN_QTY,
                 min_order_qty: MIN_ORDER_QTY,
                 min_expiry_min_for_chase: MIN_EXPIRY_MIN_FOR_CHASE,
-                min_expiry_min_for_rebal: MIN_EXPIRY_MIN_FOR_REBAL,
                 taker_buy_interval_ms: TAKER_BUY_INTERVAL_MS,
-                force_balance_slack: FORCE_BALANCE_SLACK,
-                chase_only_in_excited: CHASE_ONLY_IN_EXCITED,
+                pair_health_max: PAIR_HEALTH_MAX,
             };
+            // v0.6: MAX_BUY_PRICE 兜底守门通过 decision 内置 MAX_ENTRY_PRICE_JUMP 0.65 实现
+            let _ = MAX_BUY_PRICE;
             let (intents, effects) = decision::build_intents(
                 &fv,
                 &snap,
