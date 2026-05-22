@@ -41,6 +41,7 @@ use alloy_primitives::Address;
 use cli::{Cli, Mode};
 use config::AppConfig;
 use execution::balance::BalanceProvider;
+use execution::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig as CbRuntimeCfg};
 use execution::client::OrderClient;
 use execution::merge::build_merge_client;
 use execution::sim::ExecutionSim;
@@ -154,6 +155,16 @@ async fn main() -> Result<()> {
             http.clone(),
         )?;
 
+        let cb_cfg = cfg
+            .circuit_breaker
+            .clone()
+            .unwrap_or_default();
+        let circuit_breaker = Arc::new(CircuitBreaker::new(CbRuntimeCfg {
+            enabled: cb_cfg.enabled,
+            max_daily_loss: cb_cfg.max_daily_loss,
+            max_consecutive_errors: cb_cfg.max_consecutive_errors,
+        }));
+
         let mut live = LiveOrderClient::with_http(
             signer,
             creds,
@@ -162,6 +173,7 @@ async fn main() -> Result<()> {
             Arc::clone(&state),
             http,
             db_tx.clone(),
+            Arc::clone(&circuit_breaker),
         )
         .await?;
         live.attach_merge_client(Arc::new(merge_client));

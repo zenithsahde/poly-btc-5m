@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod circuit_breaker;
 pub mod client;
 pub mod gateway;
 pub mod ioc;
