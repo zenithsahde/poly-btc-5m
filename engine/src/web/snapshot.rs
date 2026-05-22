@@ -14,7 +14,7 @@ use shared_types::{
 use crate::position::{
     ManagedOrder, OrderStatus, PendingOrderReason, PositionSide as LedgerSide, TradeRecord,
 };
-use crate::tui::app::{AppState, BookLevel, ChaseSide};
+use crate::tui::app::{AppState, BookLevel};
 
 const POLY_BOOK_DEPTH: usize = 15;
 
@@ -252,13 +252,6 @@ fn levels_from_capped(src: &[BookLevel], cap: usize) -> Vec<Level> {
             qty: l.qty,
         })
         .collect()
-}
-
-fn chase_side_str(s: ChaseSide) -> String {
-    match s {
-        ChaseSide::Up => "UP".to_string(),
-        ChaseSide::Down => "DOWN".to_string(),
-    }
 }
 
 fn managed_order_tuple(order: Option<&ManagedOrder>) -> Option<(f64, f64, i64)> {
