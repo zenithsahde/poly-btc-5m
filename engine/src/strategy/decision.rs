@@ -113,9 +113,18 @@ pub fn build_intents(
         && snap.down_ask <= MAX_ENTRY_PRICE_JUMP
         && !lockin_blocks_down;
 
+    // force-balance（v0.4.6 实证 PnL 从 -$1501 提升到 +$110 的关键守门）：
+    // 只允许买"我方持仓 ≤ 对侧"的方向，单向趋势市场不会累积单边残仓。
+    // v0.6 双向 jump 自然配对 + force-balance 共同构成安全网，缺一不可。
+    let balance_ok_up = snap.qty_up <= snap.qty_down;
+    let balance_ok_down = snap.qty_down <= snap.qty_up;
+
     // 节流：同侧 1s 一笔，避免同 jump 连续下多次
-    let jump_buy_up = up_jump && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms;
-    let jump_buy_down = down_jump && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms;
+    let jump_buy_up =
+        up_jump && balance_ok_up && now_ms - last_taker_up_ts_ms >= th.taker_buy_interval_ms;
+    let jump_buy_down = down_jump
+        && balance_ok_down
+        && now_ms - last_taker_down_ts_ms >= th.taker_buy_interval_ms;
 
     // _fv 仅留作签名兼容（jump 路径不查 FV gap）
     let _ = fv;
