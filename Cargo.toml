@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "engine",
+    "shared-types",
+]
+# web-ui 是 wasm32 目标，单独构建（trunk 在 web-ui/ 目录运行），故不放入 workspace members 以避免 cargo 默认尝试用 host target 编译
+exclude = ["web-ui"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,31 @@
+# Build artifacts
+target/
+*.lock.bak
+web-ui/dist/
+
+# Trading data outputs (regenerated each run)
+trades/
+orders/
+fv_snapshots/
+excited_snapshots/
+snapshots_30ms/
+
+# Logs
+*.log
+engine.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local env
+.env
+.env.local
+config/local.toml
+
+# Tooling state
+.claude/
+__pycache__/
+*.pyc
