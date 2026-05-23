@@ -154,6 +154,8 @@ impl AppConfig {
             // API key 从独立环境变量读取（安全）
             .set_override_option("api.api_key", std::env::var("BINANCE_API_KEY").ok())?
             .set_override_option("api.secret_key", std::env::var("BINANCE_SECRET_KEY").ok())?
+            // 钱包私钥从 env 注入，避免落盘到 config.toml
+            .set_override_option("wallet.private_key", std::env::var("POLY_PRIVATE_KEY").ok())?
             .build()?;
 
         Ok(config.try_deserialize()?)

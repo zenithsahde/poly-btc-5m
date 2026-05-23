@@ -3,8 +3,9 @@
 #
 # 用法：
 #   cp config.toml.example config.toml
-#   # 然后在 [wallet] 段填入 private_key / wallet_address
-#   # 币安 API key 通过环境变量 BINANCE_API_KEY / BINANCE_SECRET_KEY 注入
+#   # 在 [wallet] 段填入 wallet_address / signature_mode
+#   # 私钥走环境变量 POLY_PRIVATE_KEY（见 .env.example），不要写到本文件
+#   # 币安 API key 通过环境变量 BINANCE_API_KEY / BINANCE_SECRET_KEY 注入（当前未使用）
 #
 # 环境变量覆盖：APP__SECTION__KEY=value（双下划线分隔层级）
 # ──────────────────────────────────────────────
@@ -81,8 +82,7 @@ max_consecutive_errors = 5
 signature_mode = "safe"
 # TODO: 实盘填入实际地址
 wallet_address = "0x0000000000000000000000000000000000000000"
-# TODO: 实盘填入私钥（hex，0x 前缀）；留空 = dry-run 模式
-private_key = ""
+
 # 32-byte hex (0x-prefixed)；留空字符串视为 zero builder
 builder_code = ""
 # Polygon RPC URL（pUSD 余额查询用）
