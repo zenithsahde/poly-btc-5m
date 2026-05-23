@@ -7,7 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::execution::client::{OrderSide, OrderType, PlaceOrderRequest};
-use crate::execution::transaction::{build_order_row, IntentSnapshot, SharedClob};
+use crate::execution::transaction::{
+    build_order_row, is_fak_killed_result, IntentSnapshot, SharedClob,
+};
 use crate::position::PositionSide;
 use crate::web::db::DbMsg;
 
@@ -96,12 +98,15 @@ pub async fn run_resubmit_worker(
                     taking,
                     "resubmit POST ok"
                 );
-                if resp.success {
+                let killed = is_fak_killed_result(&resp);
+                if resp.success || killed {
+                    // 成交 OK 或 FAK 空吃（良性）都不计错误。
                     shared.circuit_breaker.record_success();
                 } else {
                     shared.circuit_breaker.record_error();
                 }
-                if attempt < MAX_RESUBMIT_ATTEMPTS {
+                // FAK 空吃不再续发（无流动性，续发也是 kill）；其余按部分成交/失败逻辑续。
+                if !killed && attempt < MAX_RESUBMIT_ATTEMPTS {
                     if let Some(next) = build_next_request(&req, &resp, requested_size, taking) {
                         let _ = self_tx.send(next);
                     }

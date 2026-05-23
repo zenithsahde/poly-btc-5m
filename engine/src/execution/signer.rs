@@ -6,10 +6,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-use crate::execution::client::{OrderSide, PlaceOrderRequest};
+use crate::execution::client::{OrderSide, OrderType, PlaceOrderRequest};
 
 pub const EXCHANGE_V2: Address = address!("E111180000d2663C0091e4f400237545B87B996B");
-const MICRO: f64 = 1_000_000.0;
+
+// 金额精度（micro = 1e6 单位）。tick=0.01 → RoundConfig{price:2, size:2, amount:4}：
+// size 档 = 2 位小数（micro 整除 10_000），amount 档 = 4 位小数（micro 整除 100）。
+// BTC 5m up/down 常态 0.01 档，先硬编码；如遇 0.001 档市场需按真实 tick 调整。
+const SIZE_STEP: u128 = 10_000; // 0.01 unit
+const AMOUNT_STEP: u128 = 100; // 0.0001 unit
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,14 +66,58 @@ sol! {
     }
 }
 
-// BUY: maker=USDC 付出, taker=shares 收到；SELL 互为镜像。price 先 round 到 0.01 tick。
-pub fn amounts_for(side: OrderSide, price: f64, size_shares: f64) -> (u128, u128) {
-    let p = (price * 100.0).round() / 100.0;
-    let usdc = (p * size_shares * MICRO).round() as u128;
-    let shares = (size_shares * MICRO).round() as u128;
+#[inline]
+fn floor_step(micro: u128, step: u128) -> u128 {
+    (micro / step) * step
+}
+
+/// price(f64) → bps，按 0.01 tick 取整（0.53 → 5300）。
+#[inline]
+fn price_to_bps(price: f64) -> u128 {
+    let cents = (price * 100.0).round().max(0.0) as u128;
+    cents * 100
+}
+
+/// 计算 (maker_amount, taker_amount)，单位 micro(1e6)。
+///
+/// Polymarket 对市价(FAK/FOK)与限价(GTC/GTD)用不同精度规则（tick=0.01）：
+/// - 限价 BUY：taker(shares) 取 2 位 → maker(USDC)=price×taker 取 4 位
+/// - 市价 BUY：maker(USDC,花的钱) 取 2 位 → taker(shares)=maker/price 取 4 位
+/// - SELL：maker(shares) 取 2 位 → taker(USDC)=price×maker 取 4 位（市/限同式）
+/// 报错 "market buy ... maker max 2 decimals, taker max 4 decimals" 即市价 BUY 这条。
+pub fn amounts_for(
+    side: OrderSide,
+    price: f64,
+    size_shares: f64,
+    order_type: OrderType,
+) -> (u128, u128) {
+    let bps = price_to_bps(price);
+    if bps == 0 {
+        return (0, 0);
+    }
+    let size_micro = (size_shares * 1_000_000.0).round().max(0.0) as u128;
+    let is_market = matches!(order_type, OrderType::Fak);
+
     match side {
-        OrderSide::Buy => (usdc, shares),
-        OrderSide::Sell => (shares, usdc),
+        OrderSide::Buy if is_market => {
+            // maker(USDC,2dp) 为输入端；taker(shares)=maker/price 取 4dp
+            let usdc_raw = bps * size_micro / 10_000;
+            let maker = floor_step(usdc_raw, SIZE_STEP);
+            let taker = floor_step(maker * 10_000 / bps, AMOUNT_STEP);
+            (maker, taker)
+        }
+        OrderSide::Buy => {
+            // 限价：taker(shares,2dp) 为输入端；maker(USDC)=price×taker 取 4dp
+            let taker = floor_step(size_micro, SIZE_STEP);
+            let maker = floor_step(bps * taker / 10_000, AMOUNT_STEP);
+            (maker, taker)
+        }
+        OrderSide::Sell => {
+            // maker(shares,2dp) 为输入端；taker(USDC)=price×maker 取 4dp
+            let maker = floor_step(size_micro, SIZE_STEP);
+            let taker = floor_step(bps * maker / 10_000, AMOUNT_STEP);
+            (maker, taker)
+        }
     }
 }
 
@@ -168,7 +217,8 @@ impl PolySigner {
 
     pub fn build_order(&self, req: &PlaceOrderRequest, salt: u64, ts_ms: u64) -> Order {
         let token_id = U256::from_str_radix(&req.token_id, 10).unwrap_or(U256::ZERO);
-        let (maker_micro, taker_micro) = amounts_for(req.side, req.price, req.size_shares);
+        let (maker_micro, taker_micro) =
+            amounts_for(req.side, req.price, req.size_shares, req.order_type);
         Order {
             salt: U256::from(salt),
             maker: self.maker(),
@@ -342,6 +392,37 @@ fn compute_tds_struct_hash(contents_hash: B256, deposit_wallet: Address) -> B256
 mod tests {
     use super::*;
     use alloy_primitives::{PrimitiveSignature, U256};
+
+    // 复现报错场景：order_size_usdc=10 / price=0.53 → size_shares≈18.8679 的市价 BUY。
+    // 市价 BUY：maker(USDC) 必须 2dp（micro 整除 10_000），taker(shares) 4dp（整除 100）。
+    #[test]
+    fn market_buy_respects_2dp_maker_4dp_taker() {
+        let size = 10.0 / 0.53; // 18.8679…
+        let (maker, taker) = amounts_for(OrderSide::Buy, 0.53, size, OrderType::Fak);
+        assert_eq!(maker % SIZE_STEP, 0, "maker 须 2dp(整除 10_000): {maker}");
+        assert_eq!(taker % AMOUNT_STEP, 0, "taker 须 4dp(整除 100): {taker}");
+        assert_eq!(maker, 10_000_000); // 10.00 USDC
+        assert_eq!(taker, 18_867_900); // 18.8679 shares
+    }
+
+    // 限价 BUY：taker(shares) 2dp，maker(USDC) 4dp。干净输入应原样通过。
+    #[test]
+    fn limit_buy_clean_amounts() {
+        let (maker, taker) = amounts_for(OrderSide::Buy, 0.5, 10.0, OrderType::Gtc);
+        assert_eq!(taker, 10_000_000); // 10.00 shares
+        assert_eq!(maker, 5_000_000); // 5.0000 USDC
+        assert_eq!(taker % SIZE_STEP, 0);
+        assert_eq!(maker % AMOUNT_STEP, 0);
+    }
+
+    // 限价 BUY 带零头 size：taker 截到 2dp，maker=price×taker 截到 4dp。
+    #[test]
+    fn limit_buy_truncates_share_size() {
+        let (maker, taker) = amounts_for(OrderSide::Buy, 0.99, 10.005_678, OrderType::Gtc);
+        assert_eq!(taker, 10_000_000); // 截到 2dp
+        assert_eq!(maker % AMOUNT_STEP, 0);
+        assert_eq!(maker, 9_900_000); // 0.99 × 10.00 = 9.9000
+    }
 
     const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const EXPECTED_EOA: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");

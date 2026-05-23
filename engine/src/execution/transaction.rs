@@ -52,8 +52,18 @@ fn unix_ts_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// 生成订单 salt。CLOB V2 wire body 把 salt 当 JSON integer（服务端按 int64 解析），
+/// 直接用 `rand::random::<u64>()` 经常 > 2^63 会被拒为 "Invalid order payload"。
+/// 这里截断到 52 位（< 2^52 ≈ 4.5e15），既落在 int64 安全区、又是 JS safe integer，
+/// 与 py-clob-client / poly-lotto 的小整数 salt 量级一致。签名用同一 salt，不影响校验。
+#[inline]
+pub fn gen_salt() -> u64 {
+    rand::random::<u64>() & ((1u64 << 52) - 1)
+}
+
 #[derive(Clone)]
 pub struct ApiCreds {
+    api_key: String,
     api_key_hv: HeaderValue,
     passphrase_hv: HeaderValue,
     hmac_template: HmacSha256,
@@ -67,10 +77,17 @@ impl ApiCreds {
         Ok(Self {
             hmac_template: HmacSha256::new_from_slice(&decoded)
                 .map_err(|e| anyhow!("HMAC key: {e}"))?,
+            api_key: api_key.to_string(),
             api_key_hv: HeaderValue::from_str(api_key).map_err(|e| anyhow!("api_key: {e}"))?,
             passphrase_hv: HeaderValue::from_str(passphrase)
                 .map_err(|e| anyhow!("passphrase: {e}"))?,
         })
+    }
+
+    /// CLOB API key (UUID). 用作 POST /order body 的 `owner` 字段。
+    #[inline]
+    pub fn api_key(&self) -> &str {
+        &self.api_key
     }
 
     fn sign(&self, ts: u64, method: &[u8], path: &[u8], body: &[u8]) -> String {
@@ -99,9 +116,11 @@ impl ApiCreds {
 }
 
 pub fn build_http2_client() -> Result<Client> {
+    // 让 ALPN 协商协议（h2 / http1.1）。
+    // 不用 http2_prior_knowledge：某些 Cloudflare 边缘 / 中间代理不接受裸 h2，
+    // 会回 http1.1 字节流被当成 h2 帧解析 → "frame with invalid size"。
     Client::builder()
         .use_native_tls()
-        .http2_prior_knowledge()
         .tcp_nodelay(true)
         .http2_adaptive_window(true)
         .http2_initial_stream_window_size(Some(4 * 1024 * 1024))
@@ -149,20 +168,26 @@ pub async fn derive_api_key(signer: &PolySigner, http: &Client) -> Result<(Strin
     ))
 }
 
-pub fn to_json_v2(order: &Order, sig: &[u8], order_type: OrderType) -> serde_json::Value {
-    let owner = order.maker.to_checksum(None);
+// `owner` 必须是 CLOB API key (UUID)，与 POLY_API_KEY 头一致；不是钱包地址。
+// 早期误填 maker 地址会被服务端拒为 "Invalid order payload"。
+pub fn to_json_v2(order: &Order, sig: &[u8], order_type: OrderType, owner: &str) -> serde_json::Value {
+    let maker = order.maker.to_checksum(None);
+    // V2 wire body：expiration 是 API 必填字段（不在 EIP-712 签名结构里），GTC 用 "0" 表示永不过期。
+    // salt 走 JSON number（int64，见 gen_salt 的范围约束），服务端按整数解析，不影响签名校验。
+    let salt_num: u64 = order.salt.try_into().unwrap_or(0);
     let mut p = json!({
         "owner": owner,
         "orderType": match order_type { OrderType::Fak => "FAK", OrderType::Gtc => "GTC" },
         "order": {
-            "salt": order.salt.to_string(),
+            "salt": salt_num,
             "side": if order.side == 0 { "BUY" } else { "SELL" },
-            "maker": owner,
+            "maker": maker,
             "signer": order.signer.to_checksum(None),
             "tokenId": order.tokenId.to_string(),
             "signature": format!("0x{}", hex::encode(sig)),
             "makerAmount": order.makerAmount.to_string(),
             "takerAmount": order.takerAmount.to_string(),
+            "expiration": "0",
             "signatureType": order.signatureType,
             "timestamp": order.timestamp.to_string(),
             "metadata": format!("0x{}", hex::encode(order.metadata.as_slice())),
@@ -226,6 +251,23 @@ fn extract_error_msg(text: &str) -> Option<String> {
         .get("errorMsg")?
         .as_str()
         .map(String::from)
+}
+
+/// FAK 无对手被 kill 时服务端用的 status 标记。这类 400 属正常市况（盘口没流动性可吃），
+/// 既不算系统错误（不喂熔断器），也不该重发（下个 tick 重新评估即可）。
+pub const STATUS_FAK_KILLED: &str = "fak_killed";
+
+/// 判断 400 的错误文案是否为 FAK 空吃（区别于签名/金额/鉴权这类真错误）。
+#[inline]
+fn is_fak_killed(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("no orders found to match") || m.contains("killed if no match")
+}
+
+/// 该下单结果是否为良性的 FAK 空吃。
+#[inline]
+pub fn is_fak_killed_result(resp: &PlaceOrderResult) -> bool {
+    resp.status == STATUS_FAK_KILLED
 }
 
 // 预构建 POST/DELETE Request 模板：Accept / Content-Type / POLY_ADDRESS / POLY_API_KEY / POLY_PASSPHRASE
@@ -329,7 +371,9 @@ impl LiveOrderClient {
         db_tx: DbSender,
         circuit_breaker: Arc<CircuitBreaker>,
     ) -> Result<Self> {
-        let wallet = signer.maker().to_checksum(None);
+        // POLY_ADDRESS 头必须是 API key 归属地址 = 派生 key 用的 EOA(signer)，不是 Safe/maker。
+        // 用 maker(Safe) 会被拒：the order signer address has to be the address of the API KEY。
+        let wallet = signer.signer_address().to_checksum(None);
         let post_template = build_request_template(ORDER_URL, &wallet, &creds, Method::POST)?;
         let delete_template = build_request_template(ORDER_URL, &wallet, &creds, Method::DELETE)?;
 
@@ -385,9 +429,15 @@ impl SharedClob {
         if !status.is_success() {
             debug!(%status, error = %text, "place_order failed");
             let err_msg = extract_error_msg(&text).unwrap_or_else(|| format!("({status}) {text}"));
+            // FAK 空吃单独标记，让上层按良性处理（不熔断、不重发）。
+            let status_str = if is_fak_killed(&err_msg) {
+                STATUS_FAK_KILLED.to_string()
+            } else {
+                format!("http_{}", status.as_u16())
+            };
             return Ok(PlaceOrderResult {
                 success: false,
-                status: format!("http_{}", status.as_u16()),
+                status: status_str,
                 error_msg: Some(err_msg),
                 elapsed: t.elapsed().as_millis() as u64,
                 ..Default::default()
@@ -399,10 +449,15 @@ impl SharedClob {
 
     /// 签名 + POST /order：resubmit worker 直接复用。
     pub async fn sign_and_post(&self, req: &PlaceOrderRequest) -> Result<PlaceOrderResult> {
-        let salt: u64 = rand::random();
+        let salt: u64 = gen_salt();
         let order = self.signer.build_order(req, salt, unix_ts_ms());
         let sig = self.signer.sign_order(&order).await?;
-        let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
+        let body = Bytes::from(serde_json::to_vec(&to_json_v2(
+            &order,
+            &sig,
+            req.order_type,
+            self.creds.api_key(),
+        ))?);
         let template = clone_template(&self.post_template);
         self.post_order(template, body).await
     }
@@ -591,10 +646,15 @@ pub fn maybe_resubmit(
 #[async_trait]
 impl OrderClient for LiveOrderClient {
     async fn place_order(&self, req: PlaceOrderRequest) -> Result<PlaceOrderResult> {
-        let salt: u64 = rand::random();
+        let salt: u64 = gen_salt();
         let order = self.shared.signer.build_order(&req, salt, unix_ts_ms());
         let sig = self.shared.signer.sign_order(&order).await?;
-        let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
+        let body = Bytes::from(serde_json::to_vec(&to_json_v2(
+            &order,
+            &sig,
+            req.order_type,
+            self.shared.creds.api_key(),
+        ))?);
         self.shared.post_order(clone_template(&self.shared.post_template), body).await
     }
 
@@ -665,10 +725,15 @@ impl OrderClient for LiveOrderClient {
         let requested_size = size_shares;
         tokio::spawn(async move {
             let result: Result<PlaceOrderResult> = async {
-                let salt: u64 = rand::random();
+                let salt: u64 = gen_salt();
                 let order = shared.signer.build_order(&req, salt, unix_ts_ms());
                 let sig = shared.signer.sign_order(&order).await?;
-                let body = Bytes::from(serde_json::to_vec(&to_json_v2(&order, &sig, req.order_type))?);
+                let body = Bytes::from(serde_json::to_vec(&to_json_v2(
+                    &order,
+                    &sig,
+                    req.order_type,
+                    shared.creds.api_key(),
+                ))?);
                 shared.post_order(template, body).await
             }
             .await;
@@ -693,6 +758,19 @@ impl OrderClient for LiveOrderClient {
                         }
                         info!(?side, order_id = %resp.order_id, status = %resp.status, taking, "POST /order ok");
                         shared.circuit_breaker.record_success();
+                    } else if is_fak_killed_result(&resp) {
+                        // FAK 无对手被 kill：正常市况，撤下 pending（无成交无持仓），不熔断、不重发。
+                        if let Ok(mut s) = shared.state.write() {
+                            let ours = pending_order(&s, side).map(|o| o.client_order_id == coid).unwrap_or(false);
+                            if ours {
+                                if let Some(o) = pending_order_mut(&mut s, side) {
+                                    o.mark_rejected(now, "fak_no_match".to_string());
+                                }
+                                archive_pending(&mut s, side);
+                            }
+                        }
+                        info!(?side, "FAK killed (no match) — 无成交，良性跳过");
+                        shared.circuit_breaker.record_success();
                     } else {
                         if let Ok(mut s) = shared.state.write() {
                             let ours = pending_order(&s, side).map(|o| o.client_order_id == coid).unwrap_or(false);
@@ -710,8 +788,10 @@ impl OrderClient for LiveOrderClient {
                         shared.circuit_breaker.record_error();
                     }
 
-                    // 3. Resubmit 判定（200 部分成交 / 400 失败）
-                    maybe_resubmit(&shared, &intent_snap, &resp, requested_size, taking, 0, &coid);
+                    // 3. Resubmit 判定（200 部分成交 / 真 400 失败）；FAK 空吃不重发。
+                    if !is_fak_killed_result(&resp) {
+                        maybe_resubmit(&shared, &intent_snap, &resp, requested_size, taking, 0, &coid);
+                    }
                 }
                 Err(e) => {
                     if let Ok(mut s) = shared.state.write() {
@@ -815,6 +895,18 @@ mod tests {
     use super::*;
     use alloy_primitives::{address, Address, B256, U256};
 
+    // FAK 空吃文案被识别为良性；签名/金额类真错误不被误判。
+    #[test]
+    fn fak_killed_classification() {
+        assert!(is_fak_killed(
+            "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."
+        ));
+        assert!(!is_fak_killed("invalid signature"));
+        assert!(!is_fak_killed(
+            "invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals"
+        ));
+    }
+
     // HMAC 鉴权契约：固定输入 → 固定 base64url 签名。
     #[test]
     fn hmac_sign_known_vector() {
@@ -842,11 +934,17 @@ mod tests {
             builder: B256::ZERO,
         };
 
-        let fak = to_json_v2(&order, b"\x00", OrderType::Fak);
+        let fak = to_json_v2(&order, b"\x00", OrderType::Fak, "api-key");
         assert_eq!(fak["orderType"], "FAK");
         assert!(fak.get("postOnly").is_none());
+        // owner 是 API key，maker 才是钱包地址。
+        assert_eq!(fak["owner"].as_str().unwrap(), "api-key");
+        assert_eq!(fak["order"]["maker"].as_str().unwrap(), WALLET.to_checksum(None));
+        // expiration 是 wire body 必填（"0" = 永不过期）；salt 必须是 JSON number（非 string）。
+        assert_eq!(fak["order"]["expiration"], "0");
+        assert_eq!(fak["order"]["salt"].as_u64(), Some(0xC0FFEE));
 
-        let gtc = to_json_v2(&order, b"\x00", OrderType::Gtc);
+        let gtc = to_json_v2(&order, b"\x00", OrderType::Gtc, "api-key");
         assert_eq!(gtc["orderType"], "GTC");
         assert_eq!(gtc["postOnly"], false);
         assert_eq!(gtc["order"]["signer"].as_str().unwrap(), EOA.to_checksum(None));

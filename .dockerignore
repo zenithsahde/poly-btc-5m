@@ -1,0 +1,39 @@
+# 构建产物
+target/
+web-ui/dist/
+web-ui/target/
+
+# 本地运行产生的数据 / 日志
+trades/
+orders/
+fv_snapshots/
+excited_snapshots/
+snapshots_30ms/
+webui_db/
+*.csv
+*.log
+
+# 密钥 / 本地配置（镜像里用 config.toml.example 作为基线）
+.env
+.env.local
+config.toml
+
+# 文档 / 脚本（运行时无关）
+docs/
+scripts/
+verify-venv/
+__pycache__/
+*.pyc
+
+# 版本控制 / IDE / OS
+.git/
+.gitignore
+.github/
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# 本身
+Dockerfile
+.dockerignore

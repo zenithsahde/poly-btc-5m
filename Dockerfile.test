@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+#
+# 测试镜像：跑 place_test_order 冒烟下单。
+# 不含 web-ui (--bin place_test_order 跟前端无关)。
+#
+# 用法：
+#   docker build -f Dockerfile.test -t poly-btc-5m:test .
+#   docker run --rm \
+#     -e POLY_PRIVATE_KEY=0x... \
+#     -e TEST_TOKEN_ID=... -e TEST_SHARES=10 -e TEST_PRICE=0.5 \
+#     poly-btc-5m:test
+
+# ─── 构建阶段 ────────────────────────────────────────────────────────
+FROM rust:1-bookworm AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY shared-types ./shared-types
+COPY engine       ./engine
+
+RUN cargo build --release -p rust_engine --bin place_test_order
+
+
+# ─── 运行时镜像 ──────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /src/target/release/place_test_order /usr/local/bin/place_test_order
+# 基线配置（只读）；用 env (APP__SECTION__KEY=...) 覆盖，私钥走 POLY_PRIVATE_KEY
+COPY config.toml.example ./config.toml
+
+ENTRYPOINT ["place_test_order"]
+CMD []
