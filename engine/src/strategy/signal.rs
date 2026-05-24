@@ -10,8 +10,9 @@ use tracing::warn;
 
 use crate::{
     config::AppConfig,
-    execution::ioc,
+    execution::client::OrderClient,
     model::{orderbook::LocalOrderBook, ticker::BestBidAsk, trade::Trade},
+    position::PositionSide,
     strategy::{
         decision::{self, MarketSnapshot, Thresholds},
         excited_snapshots::{ExcitedSnapshotWriter, SnapshotRow},
@@ -96,13 +97,19 @@ pub struct SignalEngine {
     fv_engine: FvEngine,
     /// 全量快照采集器（v0.3.3）：每个 BookTicker / PolyBookUpdate 都落盘
     fv_snapshot_writer: FvSnapshotWriter,
-    /// 同侧 taker buy 节流时间戳；IOC 成交后更新，供 decision 的 1s 节流读取。
+    /// 同侧 taker buy 节流时间戳；marketable BuyIntent / sim fill 后更新，供 decision 1s 节流读取。
     last_taker_up_ts_ms: i64,
     last_taker_down_ts_ms: i64,
+    /// 干跑由 ExecutionSim impl，实盘由 LiveOrderClient impl。
+    order_client: Arc<dyn OrderClient>,
 }
 
 impl SignalEngine {
-    pub fn new(config: AppConfig, state: Arc<RwLock<AppState>>) -> Self {
+    pub fn new(
+        config: AppConfig,
+        state: Arc<RwLock<AppState>>,
+        order_client: Arc<dyn OrderClient>,
+    ) -> Self {
         let depth_limit = config.orderbook.depth_levels;
         let symbol = config.trading.symbol.clone();
         Self {
@@ -117,6 +124,7 @@ impl SignalEngine {
             fv_snapshot_writer: FvSnapshotWriter::new(),
             last_taker_up_ts_ms: 0,
             last_taker_down_ts_ms: 0,
+            order_client,
         }
     }
 
@@ -557,27 +565,34 @@ impl SignalEngine {
                 self.last_taker_down_ts_ms,
             );
 
-            // 步骤 E：用 IOC 走簿执行器立即成交每笔 BuyIntent。
-            // execute_ioc_buy：从 best_ask 逐档吃到 worst_price，剩余即撤（全 taker）。
+            // 步骤 E：先驱动 OrderClient.tick（dry-run 推进 sim 队列；实盘做 ttl/reprice 撤单），
+            // 再 dispatch 本批 BuyIntent。marketable 单同步推 last_taker_*_ts_ms 节流戳（实盘
+            // 无 WS fill listener，靠这条同步反馈维持决策节流稳定）。
             // v0.6: DecisionSideEffects 已空，无副作用字段需要写回。
             let _ = effects;
             if let Ok(mut s) = self.state.write() {
+                let (up_fill, down_fill) =
+                    self.order_client.tick(&mut s, fair_p, fair_down, now_ms);
+                if up_fill {
+                    self.last_taker_up_ts_ms = now_ms;
+                }
+                if down_fill {
+                    self.last_taker_down_ts_ms = now_ms;
+                }
                 for intent in &intents {
-                    let outcome = ioc::execute_ioc_buy(
-                        &mut s,
-                        intent.side,
-                        intent.qty,
-                        intent.target,
-                        intent.worst,
-                        intent.reason,
-                        now_ms,
-                    );
-                    if outcome.filled_qty > 0.0 {
+                    let (ask, token_id) = match intent.side {
+                        ChaseSide::Up => (s.poly_best_ask, s.poly_token_id.clone()),
+                        ChaseSide::Down => (s.poly_down_best_ask, s.poly_down_token_id.clone()),
+                    };
+                    let marketable = ask > 0.0 && ask <= intent.target;
+                    if marketable {
                         match intent.side {
-                            ChaseSide::Up => self.last_taker_up_ts_ms = now_ms,
-                            ChaseSide::Down => self.last_taker_down_ts_ms = now_ms,
+                            PositionSide::Up => self.last_taker_up_ts_ms = now_ms,
+                            PositionSide::Down => self.last_taker_down_ts_ms = now_ms,
                         }
                     }
+                    self.order_client
+                        .dispatch_buy_intent(intent, ask, &token_id, now_ms, &mut s);
                 }
             }
             if let Some((win, row)) = excited_snap {

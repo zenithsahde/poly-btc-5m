@@ -31,6 +31,10 @@ pub struct Cli {
     /// Trunk 构建产物目录（仅 --web 时使用）
     #[arg(long, default_value = "web-ui/dist")]
     pub web_dist: String,
+
+    /// 强制 dry-run（即使配置了 [wallet].private_key 也忽略）
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

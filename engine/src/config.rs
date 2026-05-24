@@ -1,5 +1,5 @@
 /// config.rs - 配置加载模块
-/// 从 config/default.toml + 环境变量中加载配置
+/// 从根目录 config.toml + 环境变量中加载配置
 use anyhow::Result;
 use config::{Config, Environment, File};
 use serde::Deserialize;
@@ -16,7 +16,6 @@ pub struct TradingConfig {
     pub symbol: String,
     pub streams: Vec<String>,
     pub poly_token_id: String,
-    pub wallet_address: String,
     /// 5m 公允价：行权价 K（未从 Poly 解析时使用）
     #[serde(default = "default_strike_price")]
     pub strike_price: f64,
@@ -30,6 +29,8 @@ pub struct TradingConfig {
     /// 稳态下用 Poly 反解 IV 时的 σ 上限（允许更高以便 FV 贴近 Poly 盘口，例如 5.0）
     #[serde(default = "default_sigma_max_poly")]
     pub volatility_sigma_max_poly: f64,
+    // 每笔 BuyIntent 的下单名义额（USDC）；必须在 default.toml 配置，不提供代码默认。
+    pub order_size_usdc: f64,
 }
 
 fn default_strike_price() -> f64 {
@@ -79,6 +80,52 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_cb_enabled")]
+    pub enabled: bool,
+    /// 当日 cash_pnl 亏损超过该 USDC 数额即永久熔断
+    #[serde(default = "default_cb_max_daily_loss")]
+    pub max_daily_loss: f64,
+    /// 连续下单错误（rejected / transport failed）超过该值即永久熔断
+    #[serde(default = "default_cb_max_consecutive_errors")]
+    pub max_consecutive_errors: u32,
+}
+
+fn default_cb_enabled() -> bool {
+    true
+}
+fn default_cb_max_daily_loss() -> f64 {
+    50.0
+}
+fn default_cb_max_consecutive_errors() -> u32 {
+    5
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cb_enabled(),
+            max_daily_loss: default_cb_max_daily_loss(),
+            max_consecutive_errors: default_cb_max_consecutive_errors(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WalletConfig {
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_mode: crate::execution::signer::SignatureMode,
+    // builder_code: 32-byte hex (0x-prefixed)，空字符串视为 zero builder。default.toml 必填。
+    pub builder_code: String,
+    // Polygon RPC URL，pUSD 余额查询用。default.toml 必填。
+    pub polygon_rpc_url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub exchange: ExchangeConfig,
     pub trading: TradingConfig,
@@ -87,14 +134,18 @@ pub struct AppConfig {
     pub orderbook: OrderBookConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub wallet: Option<WalletConfig>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        // 配置加载优先级：default.toml < 环境变量
+        // 配置加载优先级：根目录 config.toml < 环境变量
         // 环境变量格式：APP__TRADING__SYMBOL=ETHUSDT（双下划线分隔层级）
         let config = Config::builder()
-            .add_source(File::with_name("config/default"))
+            .add_source(File::with_name("config"))
             .add_source(
                 Environment::with_prefix("APP")
                     .separator("__")
@@ -103,6 +154,8 @@ impl AppConfig {
             // API key 从独立环境变量读取（安全）
             .set_override_option("api.api_key", std::env::var("BINANCE_API_KEY").ok())?
             .set_override_option("api.secret_key", std::env::var("BINANCE_SECRET_KEY").ok())?
+            // 钱包私钥从 env 注入，避免落盘到 config.toml
+            .set_override_option("wallet.private_key", std::env::var("POLY_PRIVATE_KEY").ok())?
             .build()?;
 
         Ok(config.try_deserialize()?)
@@ -130,3 +183,4 @@ impl AppConfig {
         format!("{}/stream?streams={}", endpoint, stream_path)
     }
 }
+

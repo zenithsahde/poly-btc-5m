@@ -1,5 +1,6 @@
 /// ws/discovery.rs - Polymarket 市场自动发现
 /// 自动获取当前/下一 5m BTC 预测市场 Token ID，并返回窗口结束时间用于自动切换
+use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
@@ -15,6 +16,8 @@ pub struct GammaMarket {
     pub active: bool,
     #[serde(rename = "endDate")]
     pub end_date: String,
+    #[serde(rename = "conditionId", default)]
+    pub condition_id: String,
 }
 
 /// 当前 5m 市场信息：Up + Down 双 token，用于完整订单簿订阅
@@ -23,8 +26,18 @@ pub struct Active5mMarket {
     pub up_token_id: String,
     pub down_token_id: String,
     pub slug: String,
+    pub condition_id: B256,
     /// Unix 秒，本 5 分钟窗口结束时间（即下一窗口开始时间）
     pub window_end_ts: i64,
+}
+
+fn parse_condition_id(raw: &str) -> Result<B256> {
+    let s = raw.strip_prefix("0x").unwrap_or(raw);
+    let bytes = hex::decode(s).with_context(|| format!("非法 conditionId hex: {raw}"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("conditionId 长度异常: {} 字节，期望 32", bytes.len());
+    }
+    Ok(B256::from_slice(&bytes))
 }
 
 impl Active5mMarket {
@@ -74,11 +87,14 @@ impl MarketDiscovery {
             serde_json::from_str(&target.clob_token_ids).context("解析 clobTokenIds 失败")?;
         let up_token = token_ids.get(0).cloned().context("未找到 Up Token ID")?;
         let down_token = token_ids.get(1).cloned().context("未找到 Down Token ID")?;
+        let condition_id = parse_condition_id(&target.condition_id)
+            .with_context(|| format!("解析 conditionId 失败: slug={}", target.slug))?;
 
         Ok(Active5mMarket {
             up_token_id: up_token,
             down_token_id: down_token,
             slug: target.slug,
+            condition_id,
             window_end_ts,
         })
     }
@@ -104,10 +120,13 @@ impl MarketDiscovery {
             serde_json::from_str(&target.clob_token_ids).context("解析 clobTokenIds 失败")?;
         let up_token = token_ids.get(0).cloned().context("未找到 Up Token ID")?;
         let down_token = token_ids.get(1).cloned().context("未找到 Down Token ID")?;
+        let condition_id = parse_condition_id(&target.condition_id)
+            .with_context(|| format!("解析 conditionId 失败: slug={}", target.slug))?;
         Ok(Active5mMarket {
             up_token_id: up_token,
             down_token_id: down_token,
             slug: target.slug,
+            condition_id,
             window_end_ts,
         })
     }
